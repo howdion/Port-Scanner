@@ -1,0 +1,4 @@
+AGENTS.md
+.venv/
+__pycache__/
+reports/
