@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import io
 import json
 import os
 import tempfile
@@ -26,6 +27,43 @@ class ScanRecord:
     scanned_at: str
 
 
+def render_report(
+    report_format: str,
+    records: Iterable[ScanRecord],
+    metadata: dict[str, Any],
+) -> str:
+    """Dựng nội dung báo cáo JSON hoặc CSV thành chuỗi.
+
+    Hàm này dùng chung cho cả CLI (ghi file) và web (tải về), nhờ vậy định dạng
+    báo cáo chỉ được định nghĩa ở một chỗ.
+
+    Raises:
+        ValueError: Khi định dạng báo cáo không phải ``json`` hoặc ``csv``.
+    """
+    rows = list(records)
+    buffer = io.StringIO()
+
+    if report_format == "json":
+        payload = {
+            "metadata": metadata,
+            "results": [asdict(record) for record in rows],
+        }
+        json.dump(payload, buffer, ensure_ascii=False, indent=2)
+        buffer.write("\n")
+    elif report_format == "csv":
+        writer = csv.DictWriter(buffer, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+        for record in rows:
+            row = asdict(record)
+            # csv tự động quote trường có dấu phẩy, xuống dòng hoặc dấu nháy.
+            row["banner"] = record.banner or ""
+            writer.writerow(row)
+    else:
+        raise ValueError(f"định dạng báo cáo không hợp lệ: {report_format}")
+
+    return buffer.getvalue()
+
+
 def write_report(
     path: Path,
     report_format: str,
@@ -41,7 +79,7 @@ def write_report(
         OSError: Khi không tạo/ghi được thư mục hoặc file báo cáo.
         ValueError: Khi định dạng báo cáo không phải ``json`` hoặc ``csv``.
     """
-    rows = list(records)
+    text = render_report(report_format, records, metadata)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     fd, temp_name = tempfile.mkstemp(
@@ -51,23 +89,7 @@ def write_report(
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
-            if report_format == "json":
-                payload = {
-                    "metadata": metadata,
-                    "results": [asdict(record) for record in rows],
-                }
-                json.dump(payload, handle, ensure_ascii=False, indent=2)
-                handle.write("\n")
-            elif report_format == "csv":
-                writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
-                writer.writeheader()
-                for record in rows:
-                    row = asdict(record)
-                    # csv tự động quote trường có dấu phẩy, xuống dòng hoặc dấu nháy.
-                    row["banner"] = record.banner or ""
-                    writer.writerow(row)
-            else:
-                raise ValueError(f"định dạng báo cáo không hợp lệ: {report_format}")
+            handle.write(text)
         os.replace(temp_name, path)
     except Exception:
         try:
