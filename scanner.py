@@ -22,6 +22,13 @@ _CLOSED_PORT_ERRORS = {
 }
 
 
+# Các cổng thường dùng giao thức HTTP: gửi thêm yêu cầu HEAD để lấy banner.
+_HTTP_PORTS = {80, 3000, 5000, 5357, 8000, 8008, 8080, 8081, 8888}
+
+# Các cổng TLS không trả banner dạng plaintext; cần handshake TLS riêng.
+_TLS_PORTS = {443, 465, 636, 990, 993, 995, 8443}
+
+
 def scan_port(host: str, port: int, timeout: float = 1.0) -> bool:
     """Quét một cổng TCP, trả về True nếu cổng đang mở.
 
@@ -87,3 +94,96 @@ def scan_ports(
 
     open_ports.sort()
     return open_ports, errors
+
+
+def _clean_banner(data: bytes, max_length: int = 120) -> str:
+    """Chuẩn hóa dữ liệu thô thành một dòng banner ngắn, dễ đọc."""
+    text = data.decode("utf-8", errors="replace")
+    lines: list[str] = []
+    for raw_line in text.splitlines():
+        # Loại bỏ ký tự điều khiển và gộp khoảng trắng để banner không phá định dạng.
+        line = "".join(char if char.isprintable() else " " for char in raw_line)
+        line = " ".join(line.split())
+        if line:
+            lines.append(line)
+
+    if not lines:
+        return ""
+
+    # Với HTTP, ưu tiên header Server vì ngắn và mô tả đúng phần mềm máy chủ.
+    for line in lines:
+        if line.lower().startswith("server:"):
+            return line[:max_length]
+    return " | ".join(lines[:2])[:max_length]
+
+
+def grab_banner(host: str, port: int, timeout: float = 0.5) -> str | None:
+    """Thử đọc banner ngắn từ một cổng đã mở.
+
+    Banner là dữ liệu đầu tiên dịch vụ gửi sau khi kết nối. Với các cổng HTTP,
+    chương trình gửi thêm một yêu cầu HEAD tối giản để máy chủ trả về header.
+
+    Args:
+        host: Địa chỉ IPv4 của mục tiêu.
+        port: Cổng đã được xác nhận là mở.
+        timeout: Thời gian chờ tối đa khi kết nối và đọc dữ liệu (giây).
+
+    Returns:
+        Banner đã rút gọn, hoặc ``None`` nếu không đọc được.
+    """
+    if port in _TLS_PORTS:
+        # TLS cần handshake riêng; bước này chỉ đọc banner plaintext.
+        return None
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            if port in _HTTP_PORTS:
+                request = (
+                    "HEAD / HTTP/1.0\r\n"
+                    f"Host: {host}\r\n"
+                    "User-Agent: PortScanner/1.0\r\n"
+                    "\r\n"
+                ).encode("ascii")
+                sock.sendall(request)
+            data = sock.recv(1024)
+    except OSError:
+        # Banner chỉ là thông tin bổ sung; lỗi đọc banner không làm hỏng kết quả quét.
+        return None
+
+    if not data:
+        return None
+    return _clean_banner(data) or None
+
+
+def grab_banners(
+    host: str,
+    ports: list[int],
+    timeout: float = 0.5,
+    workers: int = 100,
+) -> dict[int, str]:
+    """Đọc banner song song cho danh sách cổng đã mở.
+
+    Returns:
+        Từ điển ánh xạ số cổng sang banner đọc được. Cổng không có banner sẽ
+        không xuất hiện trong từ điển.
+    """
+    banners: dict[int, str] = {}
+    if not ports:
+        return banners
+
+    max_workers = max(1, min(workers, len(ports)))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(grab_banner, host, port, timeout): port
+            for port in ports
+        }
+        for future in as_completed(futures):
+            port = futures[future]
+            try:
+                banner = future.result()
+            except OSError:
+                banner = None
+            if banner:
+                banners[port] = banner
+    return banners

@@ -8,7 +8,8 @@ import math
 import sys
 import time
 
-from scanner import scan_ports
+from scanner import grab_banners, scan_ports
+from services import get_service_name
 
 
 # Các dải IP nội bộ được phép quét theo quy định an toàn của dự án.
@@ -149,6 +150,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="thời gian chờ tối đa cho mỗi kết nối (mặc định: 1.0)",
     )
     parser.add_argument(
+        "--banner-timeout",
+        default=0.5,
+        type=positive_float,
+        metavar="GIÂY",
+        help="thời gian chờ đọc banner cho mỗi cổng mở (mặc định: 0.5)",
+    )
+    parser.add_argument(
         "--workers",
         default=100,
         type=positive_int,
@@ -170,7 +178,8 @@ def main() -> int:
 
     print(
         f"Đang quét {target} với {len(args.ports)} cổng "
-        f"(timeout {args.timeout}s, {args.workers} luồng)..."
+        f"(timeout {args.timeout}s, banner {args.banner_timeout}s, "
+        f"{args.workers} luồng)..."
     )
     started = time.perf_counter()
     try:
@@ -178,6 +187,12 @@ def main() -> int:
             str(target),
             args.ports,
             timeout=args.timeout,
+            workers=args.workers,
+        )
+        banners = grab_banners(
+            str(target),
+            open_ports,
+            timeout=args.banner_timeout,
             workers=args.workers,
         )
     except KeyboardInterrupt:
@@ -194,7 +209,11 @@ def main() -> int:
     if open_ports:
         print(f"Cổng mở trên {target}:")
         for port in open_ports:
-            print(f"  {port}/tcp")
+            line = f"  {port}/tcp  {get_service_name(port)}"
+            banner = banners.get(port)
+            if banner:
+                line += f"  |  {banner}"
+            print(line)
     else:
         print(f"Không tìm thấy cổng mở trên {target}.")
 
