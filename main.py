@@ -32,6 +32,41 @@ def configure_output_encoding() -> None:
             reconfigure(encoding="utf-8")
 
 
+def stdin_is_interactive() -> bool:
+    """Kiểm tra stdin có phải terminal thật để quyết định có thể hỏi người dùng."""
+    if sys.stdin is None:
+        return False
+    try:
+        if not sys.stdin.isatty():
+            return False
+    except (AttributeError, OSError):
+        return False
+
+    if sys.platform == "win32":
+        # Windows coi NUL là character device nên isatty() vẫn trả True.
+        # GetConsoleMode phân biệt được console thật với NUL hoặc pipe.
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            kernel32.GetStdHandle.argtypes = [ctypes.c_int]
+            kernel32.GetStdHandle.restype = ctypes.c_void_p
+            kernel32.GetConsoleMode.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_uint),
+            ]
+            kernel32.GetConsoleMode.restype = ctypes.c_int
+
+            handle = kernel32.GetStdHandle(-10)
+            mode = ctypes.c_uint()
+            if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                return False
+        except (AttributeError, OSError):
+            return False
+
+    return True
+
+
 def parse_target(value: str) -> ipaddress.IPv4Address | ipaddress.IPv4Network:
     """Kiểm tra tham số mục tiêu là IPv4 hoặc CIDR IPv4 tối đa /24."""
     try:
@@ -129,15 +164,28 @@ def is_internal(
 
 def confirm_external_target(
     target: ipaddress.IPv4Address | ipaddress.IPv4Network,
+    assume_yes: bool = False,
 ) -> bool:
     """Cảnh báo và xin xác nhận trước khi quét mục tiêu ngoài dải nội bộ."""
     print(f"CẢNH BÁO: {target} không nằm trong dải IP nội bộ.")
     print("Công cụ này chỉ dùng để quét máy của bạn, mạng nhà bạn hoặc máy ảo lab.")
     print("Chỉ tiếp tục nếu bạn có quyền quét mục tiêu này.")
+
+    if assume_yes:
+        print("Đã tự xác nhận bằng --yes.")
+        return True
+
+    if not stdin_is_interactive():
+        print("Cần --yes khi chạy không tương tác.")
+        return False
+
     try:
         answer = input("Tiếp tục quét? [y/N]: ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print()
+    except EOFError:
+        print("\nKhông nhận được xác nhận; cần --yes khi chạy không tương tác.")
+        return False
+    except (KeyboardInterrupt, OSError):
+        print("\nĐã hủy xác nhận.")
         return False
     return answer in {"y", "yes"}
 
@@ -229,15 +277,24 @@ def save_report_if_requested(
         if path.is_dir():
             print(f"Lỗi: đường dẫn báo cáo là thư mục: {path}")
             return 1
-        print(f"File báo cáo đã tồn tại: {path}")
-        try:
-            answer = input("Ghi đè? [y/N]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            answer = ""
-        if answer not in {"y", "yes"}:
-            print("Không ghi đè; báo cáo không được tạo.")
-            return 1
+        if not args.force:
+            print(f"File báo cáo đã tồn tại: {path}")
+            if not stdin_is_interactive():
+                print("Cần --force khi chạy không tương tác để ghi đè.")
+                return 1
+            try:
+                answer = input("Ghi đè? [y/N]: ").strip().lower()
+            except EOFError:
+                print("\nKhông nhận được xác nhận; cần --force để ghi đè.")
+                return 1
+            except (KeyboardInterrupt, OSError):
+                print("\nĐã hủy ghi báo cáo.")
+                return 1
+            if answer not in {"y", "yes"}:
+                print("Không ghi đè; báo cáo không được tạo.")
+                return 1
+        else:
+            print(f"Ghi đè báo cáo (--force): {path}")
 
     metadata = {
         "target": str(target),
@@ -264,7 +321,8 @@ def scan_network(
     hosts = [str(host) for host in network.hosts()]
     print(
         f"Đang kiểm tra host sống trong {network} "
-        f"({len(hosts)} host, timeout {args.discovery_timeout}s)..."
+        f"({len(hosts)} host, cổng dò {format_port_spec(args.discovery_ports)}, "
+        f"timeout {args.discovery_timeout}s)..."
     )
 
     def report_progress(done: int, total: int, host: str, is_alive: bool) -> None:
@@ -276,6 +334,7 @@ def scan_network(
     try:
         alive_hosts = discover_hosts(
             hosts,
+            ports=tuple(args.discovery_ports),
             timeout=args.discovery_timeout,
             workers=args.workers,
             on_progress=report_progress,
@@ -396,11 +455,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="thời gian chờ dò host sống trong CIDR (mặc định: 0.3)",
     )
     parser.add_argument(
+        "--discovery-ports",
+        default="22,80,135,443,445",
+        type=parse_ports,
+        metavar="PORTS",
+        help="cổng dùng để dò host sống (mặc định: 22,80,135,443,445)",
+    )
+    parser.add_argument(
         "--workers",
         default=100,
         type=positive_int,
         metavar="N",
         help="số luồng quét song song (mặc định: 100)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="ghi đè file báo cáo đã tồn tại mà không hỏi",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="tự xác nhận quét mục tiêu ngoài dải nội bộ",
     )
     parser.add_argument(
         "--output",
@@ -423,7 +499,9 @@ def main() -> int:
     args = build_parser().parse_args()
     target: ipaddress.IPv4Address | ipaddress.IPv4Network = args.target
 
-    if not is_internal(target) and not confirm_external_target(target):
+    if not is_internal(target) and not confirm_external_target(
+        target, assume_yes=args.yes
+    ):
         print("Đã hủy quét.")
         return 1
 

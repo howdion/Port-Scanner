@@ -30,7 +30,7 @@ _HTTP_PORTS = {80, 3000, 5000, 5357, 8000, 8008, 8080, 8081, 8888}
 _TLS_PORTS = {443, 465, 636, 990, 993, 995, 8443}
 
 # Cổng dùng để dò nhanh host còn sống trước khi quét toàn bộ dải cổng.
-DISCOVERY_PORTS: tuple[int, ...] = (80, 443, 445)
+DISCOVERY_PORTS: tuple[int, ...] = (22, 80, 135, 443, 445)
 
 
 def scan_port(host: str, port: int, timeout: float = 1.0) -> bool:

@@ -53,7 +53,7 @@ SERVICES: dict[int, str] = {
     3306: "mysql",
     3389: "ms-wbt-server",
     5000: "http-alt",
-    5357: "http-alt",
+    5357: "wsdapi",  # WSDAPI - Web Services for Devices (IANA)
     5432: "postgresql",
     5601: "kibana",
     5672: "amqp",
