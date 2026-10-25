@@ -7,7 +7,10 @@ import ipaddress
 import math
 import sys
 import time
+from datetime import datetime
+from pathlib import Path
 
+from report import ScanRecord, write_report
 from scanner import discover_hosts, grab_banners, scan_ports
 from services import get_service_name
 
@@ -147,6 +150,112 @@ def format_port_line(port: int, banner: str | None) -> str:
     return line
 
 
+def current_timestamp() -> str:
+    """Trả về thời điểm hiện tại theo ISO 8601 kèm múi giờ."""
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def format_port_spec(ports: list[int]) -> str:
+    """Rút gọn danh sách cổng thành dạng 1-1024 hoặc 22,80,443."""
+    if not ports:
+        return ""
+
+    ordered = sorted(set(ports))
+    parts: list[str] = []
+    start = previous = ordered[0]
+    for port in ordered[1:]:
+        if port == previous + 1:
+            previous = port
+            continue
+        parts.append(f"{start}-{previous}" if start != previous else str(start))
+        start = previous = port
+    parts.append(f"{start}-{previous}" if start != previous else str(start))
+    return ",".join(parts)
+
+
+def build_records(
+    host: str,
+    open_ports: list[int],
+    banners: dict[int, str],
+    scanned_at: str,
+) -> list[ScanRecord]:
+    """Tạo các bản ghi báo cáo cho một host."""
+    return [
+        ScanRecord(
+            host=host,
+            port=port,
+            protocol="tcp",
+            service=get_service_name(port),
+            banner=banners.get(port),
+            scanned_at=scanned_at,
+        )
+        for port in open_ports
+    ]
+
+
+def resolve_output_path(value: str) -> Path:
+    """Chuẩn hóa đường dẫn báo cáo; tên file trơn được đặt trong reports/."""
+    if not value.strip():
+        raise ValueError("đường dẫn output không được để trống")
+    if value.endswith(("/", "\\")):
+        raise ValueError("đường dẫn output phải là file, không phải thư mục")
+
+    path = Path(value)
+    if path.exists() and path.is_dir():
+        raise ValueError("đường dẫn output phải là file, không phải thư mục")
+    if path.parent == Path("."):
+        path = Path("reports") / path
+    return path
+
+
+def save_report_if_requested(
+    args: argparse.Namespace,
+    target: ipaddress.IPv4Address | ipaddress.IPv4Network,
+    ports: list[int],
+    records: list[ScanRecord],
+    duration: float,
+) -> int:
+    """Ghi báo cáo nếu có --output; trả về 0 nếu thành công hoặc không cần ghi."""
+    if not args.output:
+        return 0
+
+    try:
+        path = resolve_output_path(args.output)
+    except ValueError as exc:
+        print(f"Lỗi: {exc}")
+        return 1
+
+    if path.exists():
+        if path.is_dir():
+            print(f"Lỗi: đường dẫn báo cáo là thư mục: {path}")
+            return 1
+        print(f"File báo cáo đã tồn tại: {path}")
+        try:
+            answer = input("Ghi đè? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            answer = ""
+        if answer not in {"y", "yes"}:
+            print("Không ghi đè; báo cáo không được tạo.")
+            return 1
+
+    metadata = {
+        "target": str(target),
+        "port_range": format_port_spec(ports),
+        "total_open_ports": len(records),
+        "scan_duration_seconds": round(duration, 3),
+    }
+
+    try:
+        write_report(path, args.report_format, records, metadata)
+    except (OSError, ValueError) as exc:
+        print(f"Lỗi: không thể ghi báo cáo {path}: {exc}")
+        return 1
+
+    print(f"Đã ghi báo cáo: {path}")
+    return 0
+
+
 def scan_network(
     network: ipaddress.IPv4Network,
     args: argparse.Namespace,
@@ -162,7 +271,8 @@ def scan_network(
         status = "sống" if is_alive else "không phản hồi"
         print(f"[{done}/{total}] {host}: {status}")
 
-    started = time.perf_counter()
+    records: list[ScanRecord] = []
+    report_started = time.perf_counter()
     try:
         alive_hosts = discover_hosts(
             hosts,
@@ -173,7 +283,7 @@ def scan_network(
     except KeyboardInterrupt:
         print("\nĐã hủy bởi người dùng.")
         return 130
-    elapsed = time.perf_counter() - started
+    elapsed = time.perf_counter() - report_started
 
     print(
         f"\nTìm thấy {len(alive_hosts)}/{len(hosts)} host sống "
@@ -181,7 +291,11 @@ def scan_network(
     )
     if not alive_hosts:
         print("Không có host nào phản hồi; bỏ qua quét cổng.")
-        return 0
+        total_elapsed = time.perf_counter() - report_started
+        report_status = save_report_if_requested(
+            args, network, args.ports, records, total_elapsed
+        )
+        return 1 if report_status != 0 else 0
 
     total_open_ports = 0
     for index, host in enumerate(alive_hosts, start=1):
@@ -207,6 +321,8 @@ def scan_network(
             print("\nĐã hủy bởi người dùng.")
             return 130
         host_elapsed = time.perf_counter() - host_started
+        scanned_at = current_timestamp()
+        records.extend(build_records(host, open_ports, banners, scanned_at))
 
         if errors:
             print(f"Cảnh báo: {len(errors)} cổng gặp lỗi mạng, ví dụ:")
@@ -230,7 +346,12 @@ def scan_network(
         f"\nTổng cộng: {len(alive_hosts)} host sống, "
         f"{total_open_ports} cổng mở."
     )
-    return 0
+
+    total_elapsed = time.perf_counter() - report_started
+    report_status = save_report_if_requested(
+        args, network, args.ports, records, total_elapsed
+    )
+    return 1 if report_status != 0 else 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -281,6 +402,18 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="số luồng quét song song (mặc định: 100)",
     )
+    parser.add_argument(
+        "--output",
+        metavar="FILE",
+        help="ghi báo cáo ra file; nếu chỉ ghi tên file thì đặt trong reports/",
+    )
+    parser.add_argument(
+        "--format",
+        dest="report_format",
+        choices=("json", "csv"),
+        default="json",
+        help="định dạng báo cáo khi có --output (mặc định: json)",
+    )
     return parser
 
 
@@ -320,6 +453,8 @@ def main() -> int:
         print("\nĐã hủy bởi người dùng.")
         return 130
     elapsed = time.perf_counter() - started
+    scanned_at = current_timestamp()
+    records = build_records(str(target), open_ports, banners, scanned_at)
 
     if errors:
         print(f"\nCảnh báo: {len(errors)} cổng gặp lỗi mạng, ví dụ:")
@@ -336,10 +471,14 @@ def main() -> int:
 
     print(f"\nHoàn tất: {len(open_ports)} cổng mở trong {elapsed:.2f} giây.")
 
+    report_status = save_report_if_requested(
+        args, target, args.ports, records, elapsed
+    )
+
     if errors and not open_ports:
         print("Kiểm tra kết nối mạng hoặc thử tăng --timeout.")
         return 1
-    return 0
+    return 0 if report_status == 0 else 1
 
 
 if __name__ == "__main__":

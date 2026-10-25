@@ -5,12 +5,13 @@ và lập trình socket. Chương trình nhận một địa chỉ IPv4 hoặc m
 tra cổng nào đang mở bằng TCP connect, có timeout cho từng kết nối và quét song
 song bằng thread pool. Với mỗi cổng mở, chương trình hiển thị tên dịch vụ và thử
 đọc banner ngắn. Với CIDR, chương trình dò nhanh các host còn sống trước khi quét
-cổng.
+cổng. Kết quả có thể xuất ra báo cáo JSON/CSV.
 
 > Phạm vi hiện tại: một địa chỉ IPv4 hoặc dải CIDR tối đa /24; nhận diện dịch vụ
-> theo cổng, đọc banner ngắn và dò host sống. Chưa hỗ trợ tên miền hay xuất báo cáo.
+> theo cổng, đọc banner ngắn, dò host sống và xuất báo cáo JSON/CSV. Chưa hỗ trợ
+> tên miền hay giao diện web.
 
-> Trạng thái: Bước 1, 2 và 3 đã hoàn thành.
+> Trạng thái: Bước 1, 2, 3 và 4 đã hoàn thành.
 
 ## Yêu cầu
 
@@ -36,6 +37,16 @@ Quét một dải CIDR (tối đa /24):
 ```powershell
 .venv\Scripts\python.exe main.py 127.0.0.0/30 --ports 1-1024
 ```
+
+Xuất báo cáo JSON/CSV (thư mục `reports/` được tạo tự động):
+
+```powershell
+.venv\Scripts\python.exe main.py 127.0.0.1 --ports 1-1024 --output reports/single.json --format json
+.venv\Scripts\python.exe main.py 127.0.0.1 --ports 1-1024 --output reports/single.csv --format csv
+.venv\Scripts\python.exe main.py 127.0.0.0/30 --ports 1-1024 --output reports/cidr.json --format json
+```
+
+Nếu `--output` chỉ là tên file, báo cáo được ghi vào `reports/`.
 
 Quét một vài cổng cụ thể với timeout 1 giây:
 
@@ -69,6 +80,8 @@ muốn hạn chế số kết nối đồng thời.
 | `--banner-timeout` | `0.5` | Thời gian chờ đọc banner cho mỗi cổng mở, tính bằng giây. |
 | `--discovery-timeout` | `0.3` | Thời gian chờ dò host sống trong CIDR, tính bằng giây. |
 | `--workers` | `100` | Số luồng quét song song. |
+| `--output` | không ghi file | Đường dẫn file báo cáo; nếu chỉ ghi tên file thì đặt trong `reports/`. |
+| `--format` | `json` | Định dạng báo cáo: `json` hoặc `csv` (chỉ dùng khi có `--output`). |
 
 ## Ví dụ kết quả
 
@@ -144,6 +157,65 @@ header, thường có `Server:`. Banner sau đó được rút gọn thành mộ
 
 Các cổng TLS như `443` hoặc `8443` thường không trả banner plaintext nên có thể
 không có banner; tên dịch vụ vẫn được hiển thị theo bảng ánh xạ.
+
+## Xuất báo cáo JSON/CSV
+
+Phần ghi báo cáo nằm trong `report.py`. Thêm `--output` để ghi báo cáo; nếu không
+có `--output`, chương trình chỉ in ra màn hình. `--format` chọn `json` (mặc định)
+hoặc `csv`. Nếu `--output` chỉ là tên file, báo cáo được đặt trong `reports/` và
+thư mục này được tạo tự động.
+
+- JSON có `metadata` ở đầu (mục tiêu, dải cổng, tổng số cổng mở, thời gian quét
+  `scan_duration_seconds`) và danh sách `results`.
+- CSV có các cột `host,port,protocol,service,banner,scanned_at`; module `csv`
+  tự quote banner có dấu phẩy, xuống dòng hoặc dấu nháy. File dùng UTF-8.
+- Mỗi bản ghi có `scanned_at` theo ISO 8601; `banner` là `null` trong JSON hoặc
+  trường rỗng trong CSV nếu không đọc được.
+- Nếu file đã tồn tại, chương trình hỏi `Ghi đè? [y/N]` và mặc định không ghi đè.
+- Lỗi đường dẫn/không ghi được hoặc định dạng sai được báo rõ.
+
+Ví dụ JSON:
+
+```json
+{
+  "metadata": {
+    "target": "127.0.0.1",
+    "port_range": "1-1024",
+    "total_open_ports": 2,
+    "scan_duration_seconds": 11.688
+  },
+  "results": [
+    {
+      "host": "127.0.0.1",
+      "port": 135,
+      "protocol": "tcp",
+      "service": "msrpc",
+      "banner": null,
+      "scanned_at": "2026-10-25T23:54:32+07:00"
+    },
+    {
+      "host": "127.0.0.1",
+      "port": 445,
+      "protocol": "tcp",
+      "service": "microsoft-ds",
+      "banner": null,
+      "scanned_at": "2026-10-25T23:54:32+07:00"
+    }
+  ]
+}
+```
+
+Ví dụ CSV:
+
+```csv
+host,port,protocol,service,banner,scanned_at
+127.0.0.1,135,tcp,msrpc,,2026-10-25T23:54:49+07:00
+127.0.0.1,445,tcp,microsoft-ds,,2026-10-25T23:54:49+07:00
+```
+
+Với CIDR, tất cả host nằm trong cùng một mảng `results`; `metadata.target` là dải
+CIDR. Thư mục `reports/` nằm trong `.gitignore` để kết quả quét (có thể chứa IP
+nội bộ) không bị đưa lên GitHub.
 
 ## An toàn
 
