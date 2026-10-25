@@ -8,16 +8,46 @@
 <title>Port Scanner — giao diện cục bộ</title>
 <style>
   :root {
-    color-scheme: light;
+    color-scheme: light dark;
     --bg: #f4f6f8;
     --panel: #ffffff;
     --border: #d7dde5;
     --text: #1c2733;
-    --muted: #5b6b7d;
+    --muted: #56657a;
     --accent: #1f6feb;
-    --accent-dark: #17539f;
+    --accent-strong: #17539f;
+    --accent-contrast: #ffffff;
     --danger: #b3261e;
-    --ok: #1a7f37;
+    --danger-bg: #fdf1f0;
+    --danger-border: #f0c2be;
+    --chip-bg: #eef1f4;
+    --chip-hover: #e2e7ee;
+    --track: #e5e9ee;
+    --row-hover: #f8fafc;
+    --field-disabled: #eef1f4;
+    --shadow: 0 1px 2px rgba(16, 24, 40, .05);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f141b;
+      --panel: #171e27;
+      --border: #2c3746;
+      --text: #e8eef6;
+      --muted: #a3b3c6;
+      --accent: #5b95ff;
+      --accent-strong: #86b1ff;
+      --accent-contrast: #08111f;
+      --danger: #ff9d95;
+      --danger-bg: #2b1a19;
+      --danger-border: #663a35;
+      --chip-bg: #222c39;
+      --chip-hover: #2c3846;
+      --track: #222c39;
+      --row-hover: #1c242f;
+      --field-disabled: #222c39;
+      --shadow: none;
+    }
   }
 
   * { box-sizing: border-box; }
@@ -33,9 +63,17 @@
   header, main { max-width: 1000px; margin: 0 auto; }
 
   h1 { margin: 0 0 4px; font-size: 24px; }
-  h2 { margin: 0; font-size: 17px; }
+  h2 { margin: 0; font-size: 17px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 
   .sub, .hint { color: var(--muted); font-size: 13px; }
+  .sub { margin: 0; }
+  code {
+    font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+    font-size: .95em;
+    background: var(--chip-bg);
+    padding: 1px 5px;
+    border-radius: 4px;
+  }
 
   .panel {
     background: var(--panel);
@@ -43,60 +81,111 @@
     border-radius: 10px;
     padding: 16px;
     margin-top: 16px;
+    box-shadow: var(--shadow);
   }
 
-  .field { display: flex; flex-direction: column; gap: 4px; }
-  .field label { font-size: 13px; color: var(--muted); font-weight: 600; }
+  form { display: grid; gap: 14px; }
 
-  input[type="text"] {
+  .field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+  .field > label { font-size: 13px; color: var(--muted); font-weight: 600; }
+
+  .target-row { display: flex; align-items: flex-end; gap: 8px; }
+  .target-row .grow { flex: 1 1 auto; min-width: 0; }
+  .target-row .prefix-field { flex: 0 0 96px; }
+  .slash {
+    align-self: flex-end;
+    padding-bottom: 10px;
+    color: var(--muted);
+    font-size: 18px;
+    font-weight: 700;
+  }
+
+  input[type="text"], input[type="number"] {
+    width: 100%;
     padding: 9px 11px;
     border: 1px solid var(--border);
     border-radius: 7px;
     font: inherit;
+    color: var(--text);
+    background: var(--panel);
     font-variant-numeric: tabular-nums;
   }
-  input[type="text"]:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
-  input[type="text"]:disabled { background: #eef1f4; color: var(--muted); }
+  input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  input:disabled { background: var(--field-disabled); color: var(--muted); }
+  input[aria-invalid="true"] { border-color: var(--danger); }
 
-  form { display: grid; gap: 12px; grid-template-columns: 1fr 1fr; }
-  .actions { grid-column: 1 / -1; display: flex; gap: 10px; flex-wrap: wrap; }
+  .field-error {
+    margin: 0;
+    color: var(--danger);
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; }
+  .chip {
+    padding: 6px 12px;
+    min-height: 34px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--chip-bg);
+    color: var(--text);
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .chip:hover:not(:disabled) { background: var(--chip-hover); }
+  .chip:disabled { opacity: .5; cursor: not-allowed; }
+
+  .actions { display: flex; gap: 10px; flex-wrap: wrap; }
 
   button {
     padding: 9px 16px;
+    min-height: 40px;
     border: 1px solid transparent;
     border-radius: 7px;
     font: inherit;
     font-weight: 600;
     cursor: pointer;
     background: var(--accent);
-    color: #fff;
+    color: var(--accent-contrast);
   }
-  button:hover:not(:disabled) { background: var(--accent-dark); }
-  button.secondary { background: #fff; color: var(--text); border-color: var(--border); }
-  button.secondary:hover:not(:disabled) { background: #eef1f4; }
+  button:hover:not(:disabled) { background: var(--accent-strong); }
+  button.secondary {
+    background: var(--panel);
+    color: var(--text);
+    border-color: var(--border);
+  }
+  button.secondary:hover:not(:disabled) { background: var(--chip-bg); }
   button:disabled { opacity: .5; cursor: not-allowed; }
 
   .bar-track {
     height: 10px;
-    background: #e5e9ee;
+    background: var(--track);
     border-radius: 999px;
     overflow: hidden;
-    margin: 10px 0 8px;
+    margin: 0 0 10px;
   }
   #bar-fill { height: 100%; width: 0; background: var(--accent); transition: width .2s ease; }
 
   #status-line { margin: 0; font-weight: 600; }
-  #message-line { margin: 4px 0 0; color: var(--muted); font-size: 13px; word-break: break-word; }
+  #phase-line, #message-line, #elapsed-line {
+    margin: 4px 0 0;
+    color: var(--muted);
+    font-size: 13px;
+    word-break: break-word;
+  }
 
   .alert {
     margin-top: 12px;
     padding: 10px 12px;
-    border: 1px solid #f0c2be;
+    border: 1px solid var(--danger-border);
     border-left: 4px solid var(--danger);
     border-radius: 7px;
-    background: #fdf1f0;
+    background: var(--danger-bg);
     color: var(--danger);
     font-size: 13px;
+    font-weight: 600;
     word-break: break-word;
   }
 
@@ -108,7 +197,25 @@
     flex-wrap: wrap;
     margin-bottom: 12px;
   }
-  .results-head .tools { display: flex; gap: 8px; }
+  .results-head .tools { display: flex; gap: 8px; flex-wrap: wrap; }
+
+  .badge {
+    padding: 2px 8px;
+    border: 1px solid var(--danger-border);
+    border-radius: 999px;
+    background: var(--danger-bg);
+    color: var(--danger);
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+
+  .table-wrap {
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
 
   table { width: 100%; border-collapse: collapse; }
   th, td {
@@ -116,16 +223,43 @@
     padding: 8px 10px;
     border-bottom: 1px solid var(--border);
     vertical-align: top;
+    white-space: nowrap;
   }
-  th { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+  tbody tr:last-child td { border-bottom: 0; }
+  th {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+    color: var(--muted);
+    background: var(--chip-bg);
+  }
   td { font-variant-numeric: tabular-nums; }
-  td.banner { color: var(--muted); font-size: 13px; word-break: break-word; }
-  tbody tr:hover { background: #f8fafc; }
+  td.banner { color: var(--muted); font-size: 13px; }
+  tbody tr:hover { background: var(--row-hover); }
 
-  #empty-hint { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+  .truncate {
+    display: block;
+    max-width: 42ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .empty-cell {
+    color: var(--muted);
+    font-size: 13px;
+    white-space: normal;
+  }
 
   @media (max-width: 640px) {
-    form { grid-template-columns: 1fr; }
+    body { padding: 16px 12px 48px; }
+    .panel { padding: 14px; }
+    button { min-height: 44px; }
+    .chip { min-height: 40px; }
+    input[type="text"], input[type="number"] { padding: 11px; }
+    .actions button { flex: 1 1 auto; }
+    .target-row .prefix-field { flex: 0 0 84px; }
+    .truncate { max-width: 24ch; }
   }
 </style>
 </head>
@@ -134,7 +268,7 @@
   <h1>Port Scanner</h1>
   <p class="sub">
     Giao diện cục bộ, chỉ lắng nghe trên <code>127.0.0.1</code>. Chỉ quét được mục tiêu
-    trong dải nội bộ (10/8, 172.16/12, 192.168/16, 127/8) và tối đa /24.
+    trong dải nội bộ (10/8, 172.16/12, 192.168/16, 127/8), prefix từ 24 đến 32.
   </p>
 </header>
 
@@ -142,52 +276,85 @@
   <section class="panel">
     <form id="scan-form" novalidate>
       <div class="field">
-        <label for="target">Mục tiêu (IP hoặc CIDR)</label>
-        <input id="target" name="target" type="text" value="127.0.0.1" autocomplete="off" spellcheck="false">
+        <div class="target-row">
+          <div class="field grow">
+            <label for="ip">Địa chỉ IP</label>
+            <input id="ip" name="ip" type="text" value="127.0.0.1" inputmode="decimal"
+                   autocomplete="off" spellcheck="false" aria-describedby="ip-error cidr-preview">
+          </div>
+          <span class="slash" aria-hidden="true">/</span>
+          <div class="field prefix-field">
+            <label for="prefix">CIDR, tùy chọn</label>
+            <input id="prefix" name="prefix" type="number" min="24" max="32" step="1"
+                   placeholder="24" inputmode="numeric" autocomplete="off"
+                   aria-describedby="ip-error cidr-preview">
+          </div>
+        </div>
+        <p id="ip-error" class="field-error" role="alert" hidden></p>
+        <p id="cidr-preview" class="hint"></p>
       </div>
+
       <div class="field">
         <label for="ports">Dải cổng</label>
-        <input id="ports" name="ports" type="text" value="1-1024" autocomplete="off" spellcheck="false">
+        <input id="ports" name="ports" type="text" value="1-1024" inputmode="numeric"
+               autocomplete="off" spellcheck="false">
+        <div class="chips" id="port-chips" role="group" aria-label="Gợi ý dải cổng">
+          <button type="button" class="chip"
+                  data-ports="21,22,23,25,53,80,110,135,139,143,443,445,3306,3389,8080">Phổ biến</button>
+          <button type="button" class="chip" data-ports="1-1024">1-1024</button>
+          <button type="button" class="chip" data-ports="80,443,8000-8100">Web</button>
+        </div>
       </div>
+
       <div class="actions">
         <button id="start" type="submit">Quét</button>
         <button id="cancel" type="button" class="secondary" disabled>Hủy quét</button>
       </div>
     </form>
     <p class="hint">
-      Ví dụ mục tiêu: <code>127.0.0.1</code>, <code>192.168.1.10</code>,
-      <code>127.0.0.0/30</code>. Ví dụ dải cổng: <code>1-1024</code>,
+      Ví dụ: IP <code>127.0.0.1</code> và để trống prefix (quét một máy), hoặc IP
+      <code>192.168.1.10</code> với prefix <code>24</code> (quét cả dải, được chuẩn hóa
+      thành <code>192.168.1.0/24</code>). Ví dụ dải cổng: <code>1-1024</code>,
       <code>22,80,443</code>.
     </p>
   </section>
 
   <section class="panel">
     <div class="bar-track"><div id="bar-fill"></div></div>
-    <p id="status-line">Chưa có lần quét nào.</p>
-    <p id="message-line"></p>
-    <p id="alert" class="alert" hidden></p>
+    <div id="status-region" aria-live="polite">
+      <p id="status-line">Chưa có lần quét nào.</p>
+      <p id="phase-line"></p>
+      <p id="message-line"></p>
+      <p id="elapsed-line"></p>
+    </div>
+    <p id="alert" class="alert" role="alert" hidden></p>
   </section>
 
   <section class="panel">
     <div class="results-head">
-      <h2>Kết quả <span id="count" class="hint"></span></h2>
+      <h2>
+        Kết quả
+        <span id="count" class="hint"></span>
+        <span id="partial-label" class="badge" hidden>Kết quả một phần</span>
+      </h2>
       <div class="tools">
         <button id="dl-json" type="button" class="secondary" disabled>Tải JSON</button>
         <button id="dl-csv" type="button" class="secondary" disabled>Tải CSV</button>
       </div>
     </div>
-    <table>
-      <thead>
-        <tr>
-          <th scope="col">Host</th>
-          <th scope="col">Cổng</th>
-          <th scope="col">Dịch vụ</th>
-          <th scope="col">Banner</th>
-        </tr>
-      </thead>
-      <tbody id="results-body"></tbody>
-    </table>
-    <p id="empty-hint">Chưa có kết quả.</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th scope="col">Host</th>
+            <th scope="col">Cổng</th>
+            <th scope="col">Dịch vụ</th>
+            <th scope="col">Banner</th>
+          </tr>
+        </thead>
+        <tbody id="results-body"></tbody>
+      </table>
+    </div>
   </section>
 </main>
 
@@ -197,6 +364,8 @@
 
   var TOKEN = document.querySelector('meta[name="scan-token"]').content;
   var POLL_MS = 500;
+  var EMPTY_HINT = "Chưa có kết quả. Nhập địa chỉ IP (thêm prefix nếu muốn quét cả dải), " +
+    "chọn dải cổng rồi bấm Quét.";
 
   var STATUS_TEXT = {
     running: "Đang quét",
@@ -205,19 +374,201 @@
     error: "Lỗi"
   };
 
+  var PHASE_TEXT = {
+    starting: "Đang khởi động",
+    discovery: "Đang dò host sống",
+    scanning: "Đang quét cổng"
+  };
+
+  // Câu tiếng Việt cho các mã lỗi hay gặp, để không phải hiện JSON thô.
+  var HTTP_TEXT = {
+    400: "Yêu cầu không hợp lệ",
+    403: "Bị từ chối",
+    404: "Không tìm thấy",
+    409: "Đang bận",
+    413: "Dữ liệu gửi lên quá lớn",
+    500: "Lỗi máy chủ nội bộ"
+  };
+
+  // --- BEGIN pure helpers ---
+  // Các hàm thuần, không phụ thuộc DOM. Được kiểm thử bằng script Node bên
+  // ngoài nên đừng đổi vị trí hai dòng đánh dấu ở trên và ở dưới.
+
+  var IPV4_MAX = 4294967295;
+
+  function parseIp(text) {
+    // Trả về mảng 4 octet, hoặc null nếu không phải IPv4 hợp lệ.
+    if (typeof text !== "string") {
+      return null;
+    }
+    var parts = text.trim().split(".");
+    if (parts.length !== 4) {
+      return null;
+    }
+    var octets = [];
+    for (var i = 0; i < 4; i++) {
+      var part = parts[i];
+      if (!/^\d{1,3}$/.test(part)) {
+        return null;
+      }
+      // Python từ chối số có số 0 ở đầu (ví dụ "010"), nên giao diện cũng vậy.
+      if (part.length > 1 && part.charAt(0) === "0") {
+        return null;
+      }
+      var value = Number(part);
+      if (value > 255) {
+        return null;
+      }
+      octets.push(value);
+    }
+    return octets;
+  }
+
+  function ipToNumber(octets) {
+    return ((octets[0] * 256 + octets[1]) * 256 + octets[2]) * 256 + octets[3];
+  }
+
+  function numberToIp(value) {
+    var n = value >>> 0;
+    return [
+      Math.floor(n / 16777216) % 256,
+      Math.floor(n / 65536) % 256,
+      Math.floor(n / 256) % 256,
+      n % 256
+    ].join(".");
+  }
+
+  function prefixMask(prefix) {
+    if (prefix <= 0) {
+      return 0;
+    }
+    if (prefix >= 32) {
+      return IPV4_MAX;
+    }
+    return (IPV4_MAX << (32 - prefix)) >>> 0;
+  }
+
+  function normalizeNetwork(octets, prefix) {
+    // Giống ipaddress.ip_network(value, strict=False): xóa các bit host.
+    return (ipToNumber(octets) & prefixMask(prefix)) >>> 0;
+  }
+
+  function hostRange(networkNumber, prefix) {
+    // Giống IPv4Network.hosts(): /31 có 2 host và /32 có 1 host (RFC 3021).
+    if (prefix >= 32) {
+      return { count: 1, first: networkNumber, last: networkNumber };
+    }
+    if (prefix === 31) {
+      return { count: 2, first: networkNumber, last: networkNumber + 1 };
+    }
+    var size = Math.pow(2, 32 - prefix);
+    return {
+      count: size - 2,
+      first: networkNumber + 1,
+      last: networkNumber + size - 2
+    };
+  }
+
+  function compareRecords(a, b) {
+    // Sắp xếp theo địa chỉ IP bằng so sánh số, rồi tới cổng.
+    var hostA = String(a.host);
+    var hostB = String(b.host);
+    var ipA = parseIp(hostA);
+    var ipB = parseIp(hostB);
+    if (ipA && ipB) {
+      var diff = ipToNumber(ipA) - ipToNumber(ipB);
+      if (diff !== 0) {
+        return diff;
+      }
+    } else if (hostA !== hostB) {
+      return hostA < hostB ? -1 : 1;
+    }
+    return (Number(a.port) || 0) - (Number(b.port) || 0);
+  }
+
+  function validateTarget(ipText, prefixText) {
+    // Trả về {ok, message, octets, prefix}. Kiểm tra phía giao diện chỉ để hỗ
+    // trợ người dùng; server vẫn là nơi quyết định.
+    var trimmedIp = (ipText || "").trim();
+    if (!trimmedIp) {
+      return { ok: false, message: "Hãy nhập địa chỉ IP." };
+    }
+    var octets = parseIp(trimmedIp);
+    if (!octets) {
+      return { ok: false, message: "Địa chỉ IPv4 không hợp lệ (ví dụ: 192.168.1.10)." };
+    }
+
+    var trimmedPrefix = (prefixText || "").trim();
+    if (trimmedPrefix === "") {
+      return { ok: true, message: "", octets: octets, prefix: null };
+    }
+    if (!/^\d{1,2}$/.test(trimmedPrefix)) {
+      return { ok: false, message: "Prefix phải là số nguyên từ 24 đến 32." };
+    }
+    var prefix = Number(trimmedPrefix);
+    if (prefix < 24 || prefix > 32) {
+      return { ok: false, message: "Prefix phải trong khoảng 24 đến 32." };
+    }
+    return { ok: true, message: "", octets: octets, prefix: prefix };
+  }
+
+  function buildTarget(check) {
+    var ip = numberToIp(ipToNumber(check.octets));
+    return check.prefix === null ? ip : ip + "/" + check.prefix;
+  }
+
+  function describeTarget(check) {
+    if (check.prefix === null) {
+      return numberToIp(ipToNumber(check.octets)) + " → 1 host";
+    }
+    var network = normalizeNetwork(check.octets, check.prefix);
+    var range = hostRange(network, check.prefix);
+    return numberToIp(network) + "/" + check.prefix +
+      " → " + range.count + " host, từ " + numberToIp(range.first) +
+      " đến " + numberToIp(range.last);
+  }
+
+  function formatDuration(ms) {
+    if (!isFinite(ms) || ms < 0) {
+      ms = 0;
+    }
+    var totalSeconds = Math.floor(ms / 1000);
+    var minutes = Math.floor(totalSeconds / 60);
+    var seconds = totalSeconds % 60;
+    var padded = seconds < 10 ? "0" + seconds : String(seconds);
+    if (minutes > 0) {
+      return minutes + " phút " + padded + " giây";
+    }
+    return totalSeconds + " giây";
+  }
+
+  function parseIsoMs(value) {
+    var ms = Date.parse(value);
+    return isNaN(ms) ? null : ms;
+  }
+  // --- END pure helpers ---
+
   var els = {
     form: document.getElementById("scan-form"),
-    target: document.getElementById("target"),
+    ip: document.getElementById("ip"),
+    prefix: document.getElementById("prefix"),
+    ipError: document.getElementById("ip-error"),
+    preview: document.getElementById("cidr-preview"),
     ports: document.getElementById("ports"),
+    chips: Array.prototype.slice.call(
+      document.querySelectorAll("#port-chips .chip")
+    ),
     start: document.getElementById("start"),
     cancel: document.getElementById("cancel"),
     status: document.getElementById("status-line"),
+    phase: document.getElementById("phase-line"),
     message: document.getElementById("message-line"),
+    elapsed: document.getElementById("elapsed-line"),
     bar: document.getElementById("bar-fill"),
     alert: document.getElementById("alert"),
     count: document.getElementById("count"),
+    partial: document.getElementById("partial-label"),
     tbody: document.getElementById("results-body"),
-    empty: document.getElementById("empty-hint"),
     dlJson: document.getElementById("dl-json"),
     dlCsv: document.getElementById("dl-csv")
   };
@@ -225,6 +576,13 @@
   var currentId = null;   // id lần quét gần nhất, giữ lại để tải kết quả
   var running = false;
   var pollTimer = null;
+  var elapsedTimer = null;
+  var elapsedStartMs = null;
+  var elapsedEndMs = null;
+
+  // ------------------------------------------------------------------
+  // Trạng thái và thông báo
+  // ------------------------------------------------------------------
 
   function showAlert(text) {
     els.alert.textContent = text;
@@ -236,12 +594,34 @@
     els.alert.hidden = true;
   }
 
+  function showFieldError(message) {
+    els.ipError.textContent = message;
+    els.ipError.hidden = false;
+    els.ip.setAttribute("aria-invalid", "true");
+    els.prefix.setAttribute("aria-invalid", "true");
+  }
+
+  function clearFieldError() {
+    els.ipError.textContent = "";
+    els.ipError.hidden = true;
+    els.ip.removeAttribute("aria-invalid");
+    els.prefix.removeAttribute("aria-invalid");
+  }
+
+  function setPreview(text) {
+    els.preview.textContent = text;
+  }
+
   function setBusy(isRunning) {
     running = isRunning;
     els.start.disabled = isRunning;
     els.cancel.disabled = !isRunning;
-    els.target.disabled = isRunning;
+    els.ip.disabled = isRunning;
+    els.prefix.disabled = isRunning;
     els.ports.disabled = isRunning;
+    for (var i = 0; i < els.chips.length; i++) {
+      els.chips[i].disabled = isRunning;
+    }
   }
 
   function setProgress(done, total) {
@@ -251,6 +631,194 @@
     }
     els.bar.style.width = pct + "%";
   }
+
+  function stopElapsedTimer() {
+    if (elapsedTimer !== null) {
+      clearInterval(elapsedTimer);
+      elapsedTimer = null;
+    }
+  }
+
+  function renderElapsed() {
+    if (elapsedStartMs === null) {
+      els.elapsed.textContent = "";
+      return;
+    }
+    var end = elapsedEndMs === null ? Date.now() : elapsedEndMs;
+    els.elapsed.textContent = "Đã trôi qua " + formatDuration(end - elapsedStartMs);
+  }
+
+  function startElapsedTimer(startedAt) {
+    stopElapsedTimer();
+    elapsedStartMs = parseIsoMs(startedAt);
+    elapsedEndMs = null;
+    renderElapsed();
+    elapsedTimer = setInterval(renderElapsed, 1000);
+  }
+
+  function finishElapsedTimer(startedAt, finishedAt) {
+    stopElapsedTimer();
+    elapsedStartMs = parseIsoMs(startedAt);
+    elapsedEndMs = parseIsoMs(finishedAt);
+    if (elapsedEndMs === null) {
+      elapsedEndMs = Date.now();
+    }
+    renderElapsed();
+  }
+
+  function errorText(res, data) {
+    var label = HTTP_TEXT[res.status] || ("Lỗi HTTP " + res.status);
+    var detail = (data && typeof data.error === "string") ? data.error : "";
+    return detail ? label + ": " + detail : label;
+  }
+
+  // ------------------------------------------------------------------
+  // Bảng kết quả
+  // ------------------------------------------------------------------
+
+  function clearRows() {
+    while (els.tbody.firstChild) {
+      els.tbody.removeChild(els.tbody.firstChild);
+    }
+  }
+
+  function appendTextCell(row, text) {
+    var cell = document.createElement("td");
+    // Chèn bằng textContent, không bao giờ gán chuỗi HTML.
+    cell.textContent = text;
+    row.appendChild(cell);
+  }
+
+  function appendBannerCell(row, banner) {
+    var cell = document.createElement("td");
+    cell.className = "banner";
+    if (banner) {
+      var span = document.createElement("span");
+      span.className = "truncate";
+      span.textContent = String(banner);
+      // Rê chuột hiện đầy đủ; gán bằng thuộc tính nên không phải chèn HTML.
+      span.title = String(banner);
+      cell.appendChild(span);
+    } else {
+      cell.textContent = "—";
+    }
+    row.appendChild(cell);
+  }
+
+  function renderEmptyRow(message) {
+    var row = document.createElement("tr");
+    var cell = document.createElement("td");
+    cell.colSpan = 4;
+    cell.className = "empty-cell";
+    cell.textContent = message;
+    row.appendChild(cell);
+    els.tbody.appendChild(row);
+  }
+
+  function emptyMessage(job) {
+    if (job.status === "running") {
+      return "Đang quét... cổng mở tìm được sẽ hiện dần ở đây.";
+    }
+    if (job.status === "cancelled") {
+      return "Đã hủy trước khi tìm thấy cổng mở nào. Bấm Quét để chạy lại.";
+    }
+    if (job.status === "error") {
+      return "Lần quét gặp lỗi và chưa tìm thấy cổng mở nào. Xem thông báo lỗi phía trên.";
+    }
+    return EMPTY_HINT;
+  }
+
+  function renderResults(results, job) {
+    clearRows();
+    if (!results.length) {
+      renderEmptyRow(emptyMessage(job));
+      return;
+    }
+    var sorted = results.slice().sort(compareRecords);
+    for (var i = 0; i < sorted.length; i++) {
+      var item = sorted[i];
+      var row = document.createElement("tr");
+      appendTextCell(row, String(item.host));
+      appendTextCell(row, String(item.port));
+      appendTextCell(row, String(item.service));
+      appendBannerCell(row, item.banner);
+      els.tbody.appendChild(row);
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Tiến độ
+  // ------------------------------------------------------------------
+
+  function phaseCountText(job) {
+    var progress = job.progress || {};
+    var done = progress.done || 0;
+    var total = progress.total || 0;
+    if (job.phase === "discovery") {
+      return "Đã dò " + done + "/" + total + " host";
+    }
+    if (job.phase === "scanning") {
+      return "Đã quét " + done + "/" + total + " cổng của host hiện tại";
+    }
+    return total > 0 ? done + "/" + total : "";
+  }
+
+  function hostCounterText(job) {
+    // Trong giai đoạn quét cổng, chỉ số host nằm ở đầu thông báo dạng "[1/2]".
+    var match = /^\[(\d+)\/(\d+)\]/.exec(job.message || "");
+    if (match) {
+      return "Host " + match[1] + "/" + match[2];
+    }
+    if (job.phase === "discovery") {
+      var progress = job.progress || {};
+      return "Host " + (progress.done || 0) + "/" + (progress.total || 0);
+    }
+    return "";
+  }
+
+  function renderJob(job) {
+    var progress = job.progress || { done: 0, total: 0 };
+    setProgress(progress.done || 0, progress.total || 0);
+
+    var statusLabel = STATUS_TEXT[job.status] || job.status;
+    var phaseLabel = PHASE_TEXT[job.phase];
+    els.status.textContent = phaseLabel && job.status === "running"
+      ? statusLabel + " — " + phaseLabel
+      : statusLabel;
+
+    var parts = [hostCounterText(job), phaseCountText(job)];
+    var phaseLine = [];
+    for (var i = 0; i < parts.length; i++) {
+      if (parts[i]) {
+        phaseLine.push(parts[i]);
+      }
+    }
+    els.phase.textContent = phaseLine.join(" · ");
+    els.message.textContent = job.message || "";
+
+    var errors = job.errors || [];
+    if (errors.length > 0) {
+      showAlert("Có " + errors.length + " cổng gặp lỗi mạng. Ví dụ: " + errors[0]);
+    }
+
+    renderResults(job.results || [], job);
+    els.count.textContent = "(" + (job.total_open_ports || 0) + " cổng mở)";
+    els.partial.hidden = !(job.status === "cancelled" || job.status === "error");
+
+    var ready = job.status !== "running";
+    els.dlJson.disabled = !ready;
+    els.dlCsv.disabled = !ready;
+
+    if (job.status === "running") {
+      startElapsedTimer(job.started_at);
+    } else {
+      finishElapsedTimer(job.started_at, job.finished_at);
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Gọi API
+  // ------------------------------------------------------------------
 
   function request(path, opts) {
     opts = opts || {};
@@ -272,65 +840,6 @@
     } catch (err) {
       return null;
     }
-  }
-
-  function errorText(res, data) {
-    if (data && typeof data.error === "string" && data.error) {
-      return data.error;
-    }
-    return "Lỗi HTTP " + res.status;
-  }
-
-  function clearRows() {
-    while (els.tbody.firstChild) {
-      els.tbody.removeChild(els.tbody.firstChild);
-    }
-  }
-
-  function appendCell(row, text, className) {
-    var cell = document.createElement("td");
-    // Chèn bằng textContent, không bao giờ gán chuỗi HTML: banner do máy bị
-    // quét kiểm soát nên có thể chứa mã độc.
-    cell.textContent = text;
-    if (className) {
-      cell.className = className;
-    }
-    row.appendChild(cell);
-  }
-
-  function renderResults(results) {
-    clearRows();
-    els.empty.hidden = results.length > 0;
-    for (var i = 0; i < results.length; i++) {
-      var item = results[i];
-      var row = document.createElement("tr");
-      appendCell(row, String(item.host));
-      appendCell(row, String(item.port));
-      appendCell(row, String(item.service));
-      appendCell(row, item.banner ? String(item.banner) : "—", "banner");
-      els.tbody.appendChild(row);
-    }
-  }
-
-  function renderJob(job) {
-    var progress = job.progress || { done: 0, total: 0 };
-    setProgress(progress.done || 0, progress.total || 0);
-
-    var label = STATUS_TEXT[job.status] || job.status;
-    els.status.textContent = label;
-    els.message.textContent = job.message || "";
-
-    var errors = job.errors || [];
-    if (errors.length > 0) {
-      showAlert("Có " + errors.length + " cổng gặp lỗi mạng. Ví dụ: " + errors[0]);
-    }
-
-    renderResults(job.results || []);
-    els.count.textContent = "(" + (job.total_open_ports || 0) + " cổng mở)";
-
-    var ready = job.status !== "running";
-    els.dlJson.disabled = !ready;
-    els.dlCsv.disabled = !ready;
   }
 
   function schedulePoll() {
@@ -360,6 +869,7 @@
 
     if (!res.ok) {
       setBusy(false);
+      stopElapsedTimer();
       els.status.textContent = "Đã dừng theo dõi";
       showAlert(errorText(res, data));
       return;
@@ -373,6 +883,34 @@
     }
   }
 
+  // ------------------------------------------------------------------
+  // Sự kiện giao diện
+  // ------------------------------------------------------------------
+
+  function refreshTargetHelp(reportError) {
+    var check = validateTarget(els.ip.value, els.prefix.value);
+    if (!check.ok) {
+      setPreview("");
+      if (reportError) {
+        showFieldError(check.message);
+      }
+      return false;
+    }
+    clearFieldError();
+    setPreview(describeTarget(check));
+    return true;
+  }
+
+  els.ip.addEventListener("input", function () { refreshTargetHelp(true); });
+  els.prefix.addEventListener("input", function () { refreshTargetHelp(true); });
+
+  for (var c = 0; c < els.chips.length; c++) {
+    els.chips[c].addEventListener("click", function (event) {
+      els.ports.value = event.currentTarget.getAttribute("data-ports") || "";
+      els.ports.focus();
+    });
+  }
+
   els.form.addEventListener("submit", async function (event) {
     event.preventDefault();
     if (running) {
@@ -380,24 +918,30 @@
     }
 
     clearAlert();
-    var target = els.target.value.trim();
-    var ports = els.ports.value.trim();
-    if (!target) {
-      showAlert("Hãy nhập mục tiêu (IP hoặc CIDR).");
+    var checkOk = refreshTargetHelp(true);
+    if (!checkOk) {
+      showAlert("Kiểm tra lại địa chỉ IP và prefix ở phía trên.");
       return;
     }
+    var check = validateTarget(els.ip.value, els.prefix.value);
+    var target = buildTarget(check);
+    var ports = els.ports.value.trim();
     if (!ports) {
       showAlert("Hãy nhập dải cổng, ví dụ 1-1024.");
+      els.ports.focus();
       return;
     }
 
     setBusy(true);
     els.status.textContent = "Đang gửi yêu cầu...";
+    els.phase.textContent = "";
     els.message.textContent = "";
+    els.elapsed.textContent = "";
     setProgress(0, 0);
     clearRows();
-    els.empty.hidden = false;
+    renderEmptyRow("Đang gửi yêu cầu quét...");
     els.count.textContent = "";
+    els.partial.hidden = true;
     els.dlJson.disabled = true;
     els.dlCsv.disabled = true;
 
@@ -413,13 +957,14 @@
     } catch (err) {
       setBusy(false);
       els.status.textContent = "Không kết nối được web server";
-      showAlert("Không kết nối được web server.");
+      showAlert("Không kết nối được web server. Kiểm tra xem tiến trình còn chạy không.");
       return;
     }
 
     if (!res.ok) {
       setBusy(false);
       els.status.textContent = "Không bắt đầu được";
+      renderEmptyRow(EMPTY_HINT);
       showAlert(errorText(res, data));
       return;
     }
@@ -478,6 +1023,9 @@
 
   els.dlJson.addEventListener("click", function () { download("json"); });
   els.dlCsv.addEventListener("click", function () { download("csv"); });
+
+  refreshTargetHelp(false);
+  renderEmptyRow(EMPTY_HINT);
 })();
 </script>
 </body>

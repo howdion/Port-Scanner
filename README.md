@@ -304,17 +304,39 @@ Chạy:
 Sau đó mở địa chỉ mà chương trình in ra, ví dụ
 [http://127.0.0.1:8000/](http://127.0.0.1:8000/).
 
-Giao diện gồm ô nhập mục tiêu (IP hoặc CIDR), ô nhập dải cổng, nút Quét, vùng
-hiển thị tiến độ, bảng kết quả (host, cổng, dịch vụ, banner), nút Hủy quét và hai
-nút tải kết quả JSON/CSV. Quét chạy ở thread nền; trang hỏi trạng thái định kỳ
-(polling, không dùng WebSocket).
+Giao diện gồm:
+
+- **Địa chỉ IP** và ô **CIDR, tùy chọn** (prefix `24`–`32`) nằm cùng hàng, ngăn bởi
+  dấu `/`. Để trống prefix là quét một máy; điền prefix là quét cả dải. Ví dụ IP
+  `192.168.1.10` với prefix `24` sẽ gửi lên `192.168.1.10/24` và server chuẩn hóa
+  thành `192.168.1.0/24`.
+- **Dòng xem trước** ngay dưới ô nhập, cập nhật khi gõ: `192.168.1.0/24 → 254 host,
+  từ 192.168.1.1 đến 192.168.1.254`, hoặc `127.0.0.1 → 1 host`. Phần chuẩn hóa và
+  đếm host được tính giống `ipaddress.ip_network(..., strict=False)`.
+- **Dải cổng** kèm ba chip bấm một lần để điền: `Phổ biến`, `1-1024`, `Web`.
+- **Quét** / **Hủy quét**; nhấn Enter trong ô nhập cũng bắt đầu quét. Trong lúc
+  chạy, các ô nhập và nút Quét bị vô hiệu hóa, chỉ nút Hủy còn bật.
+- **Vùng tiến độ** (`aria-live="polite"`) hiển thị giai đoạn (dò host sống / quét
+  cổng), số host đã xong trên tổng số, số cổng đã quét và thời gian đã trôi qua.
+- **Bảng kết quả** (host, cổng, dịch vụ, banner), sắp xếp theo địa chỉ IP bằng so
+  sánh số rồi theo cổng; banner rỗng hiện `—`, banner dài được cắt gọn và hiện đầy
+  đủ khi rê chuột. Khi quét bị hủy hoặc lỗi, bảng có nhãn "Kết quả một phần".
+- Hai nút **tải JSON/CSV**, và giao diện tự chuyển màu theo chế độ tối của hệ điều
+  hành (`prefers-color-scheme`) và co giãn trên màn hình hẹp.
+
+Quét chạy ở thread nền; trang hỏi trạng thái định kỳ (polling, không dùng
+WebSocket). Lỗi trả về từ server (400/403/409...) được hiện thành câu tiếng Việt
+trên vùng trạng thái, không in JSON thô.
+
+Kiểm tra IP và prefix ở phía giao diện chỉ để giúp nhập liệu nhanh; mọi giới hạn an
+toàn vẫn do server quyết định.
 
 ### API
 
 | Phương thức | Đường dẫn | Mô tả |
 | --- | --- | --- |
 | `GET` | `/` | Trang giao diện, kèm token của phiên. |
-| `POST` | `/api/scan` | Bắt đầu quét. Body JSON: `{"target": "...", "ports": "..."}`. Trả `202` kèm `id`. |
+| `POST` | `/api/scan` | Bắt đầu quét. Body JSON: `{"target": "...", "ports": "..."}`. Trả `202` kèm `id`. Trường `target` là `"ip"` hoặc `"ip/prefix"`. |
 | `GET` | `/api/scan/<id>` | Trạng thái, tiến độ và kết quả của một lần quét. |
 | `POST` | `/api/scan/<id>/cancel` | Yêu cầu hủy lần quét đang chạy. |
 | `GET` | `/api/scan/<id>/download?format=json\|csv` | Tải báo cáo, dùng lại `report.py`. |
