@@ -36,12 +36,33 @@ Port Scanner/
 ├── services.py        # bảng ánh xạ cổng → tên dịch vụ
 ├── web_server.py      # web server cục bộ, chỉ bind 127.0.0.1
 ├── README.md
+├── tests/             # kiểm thử tự động bằng unittest
+│   ├── test_parsing.py
+│   ├── test_report.py
+│   └── test_web_server.py
 ├── web/
 │   └── index.html     # giao diện web: HTML + CSS + JS thuần, một file
 ├── .venv/             # môi trường ảo (không commit)
 ├── __pycache__/       # cache Python (không commit)
 └── reports/           # báo cáo sinh ra (không commit)
 ```
+
+## Kiểm thử
+
+Bộ kiểm thử dùng `unittest` của thư viện chuẩn, không cần cài thêm gói:
+
+```powershell
+.venv\Scripts\python.exe -m unittest discover tests
+```
+
+- `tests/test_parsing.py`: phân tích mục tiêu (IPv4/CIDR) và dải cổng, kiểm tra dải nội bộ.
+- `tests/test_report.py`: dựng và ghi báo cáo JSON/CSV, xử lý ký tự đặc biệt trong banner.
+- `tests/test_web_server.py`: API của web server — token, Host/Origin, giới hạn mục tiêu,
+  giới hạn số cổng và số luồng, hai lần quét cùng lúc, hủy quét, banner chứa HTML.
+
+Mọi bài kiểm thử chỉ làm việc với `127.0.0.1`. Bài kiểm tra mục tiêu ngoài dải nội bộ
+dùng `mock` để khẳng định không có kết nối nào được mở ra ngoài loopback. Thư mục tạm
+của bài kiểm thử nằm trong `reports/` (đã bị `.gitignore` bỏ qua) và được xóa sau mỗi bài.
 
 ## Cách chạy
 
