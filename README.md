@@ -8,6 +8,8 @@ bằng thread pool.
 > Phạm vi hiện tại: một địa chỉ IPv4, một dải cổng. Chưa hỗ trợ tên miền, dải
 > CIDR, nhận diện dịch vụ hay xuất báo cáo.
 
+> Trạng thái: Bước 1 đã hoàn thành.
+
 ## Yêu cầu
 
 - Python 3.11 trở lên.
