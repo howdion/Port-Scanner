@@ -1,15 +1,16 @@
 # Port Scanner
 
 Công cụ quét cổng TCP dùng để học về mạng máy tính, đặc biệt là TCP handshake
-và lập trình socket. Chương trình nhận một địa chỉ IPv4 và một dải cổng, kiểm tra
-cổng nào đang mở bằng TCP connect, có timeout cho từng kết nối và quét song song
-bằng thread pool. Với mỗi cổng mở, chương trình hiển thị tên dịch vụ và thử đọc
-banner ngắn.
+và lập trình socket. Chương trình nhận một địa chỉ IPv4 hoặc một dải CIDR, kiểm
+tra cổng nào đang mở bằng TCP connect, có timeout cho từng kết nối và quét song
+song bằng thread pool. Với mỗi cổng mở, chương trình hiển thị tên dịch vụ và thử
+đọc banner ngắn. Với CIDR, chương trình dò nhanh các host còn sống trước khi quét
+cổng.
 
-> Phạm vi hiện tại: một địa chỉ IPv4, một dải cổng; nhận diện dịch vụ theo cổng
-> và đọc banner ngắn. Chưa hỗ trợ tên miền, dải CIDR hay xuất báo cáo.
+> Phạm vi hiện tại: một địa chỉ IPv4 hoặc dải CIDR tối đa /24; nhận diện dịch vụ
+> theo cổng, đọc banner ngắn và dò host sống. Chưa hỗ trợ tên miền hay xuất báo cáo.
 
-> Trạng thái: Bước 1 và 2 đã hoàn thành.
+> Trạng thái: Bước 1, 2 và 3 đã hoàn thành.
 
 ## Yêu cầu
 
@@ -28,6 +29,12 @@ Quét các cổng HTTP để xem banner:
 
 ```powershell
 .venv\Scripts\python.exe main.py 127.0.0.1 --ports 135,445,5357
+```
+
+Quét một dải CIDR (tối đa /24):
+
+```powershell
+.venv\Scripts\python.exe main.py 127.0.0.0/30 --ports 1-1024
 ```
 
 Quét một vài cổng cụ thể với timeout 1 giây:
@@ -49,16 +56,18 @@ Chạy không tham số sẽ quét `127.0.0.1` với các cổng `1-1024`:
 ```
 
 Tăng `--timeout` nếu mạng chậm; tăng `--banner-timeout` nếu dịch vụ trả banner
-chậm; giảm `--workers` nếu muốn hạn chế số kết nối đồng thời.
+chậm; tăng `--discovery-timeout` nếu host phản hồi chậm; giảm `--workers` nếu
+muốn hạn chế số kết nối đồng thời.
 
 ## Tham số
 
 | Tham số | Mặc định | Mô tả |
 | --- | --- | --- |
-| `target` | `127.0.0.1` | Địa chỉ IPv4 cần quét. |
+| `target` | `127.0.0.1` | Địa chỉ IPv4 hoặc dải CIDR tối đa /24. |
 | `--ports` | `1-1024` | Dải cổng hoặc danh sách cổng, ví dụ `1-1024`, `22,80,443`, `8000-8100`. |
 | `--timeout` | `1.0` | Thời gian chờ tối đa cho mỗi kết nối, tính bằng giây. |
 | `--banner-timeout` | `0.5` | Thời gian chờ đọc banner cho mỗi cổng mở, tính bằng giây. |
+| `--discovery-timeout` | `0.3` | Thời gian chờ dò host sống trong CIDR, tính bằng giây. |
 | `--workers` | `100` | Số luồng quét song song. |
 
 ## Ví dụ kết quả
@@ -74,6 +83,33 @@ Cổng mở trên 127.0.0.1:
 Hoàn tất: 3 cổng mở trong 0.53 giây.
 ```
 
+## Ví dụ quét CIDR
+
+```text
+Đang kiểm tra host sống trong 127.0.0.0/30 (2 host, timeout 0.3s)...
+[1/2] 127.0.0.2: sống
+[2/2] 127.0.0.1: sống
+
+Tìm thấy 2/2 host sống trong 0.61 giây.
+
+[1/2] Đang quét 127.0.0.1 (1024 cổng)...
+Cổng mở trên 127.0.0.1:
+  135/tcp  msrpc
+  445/tcp  microsoft-ds
+Hoàn tất host 127.0.0.1: 2 cổng mở trong 11.68 giây.
+
+[2/2] Đang quét 127.0.0.2 (1024 cổng)...
+Cổng mở trên 127.0.0.2:
+  135/tcp  msrpc
+  445/tcp  microsoft-ds
+Hoàn tất host 127.0.0.2: 2 cổng mở trong 11.66 giây.
+
+Tổng cộng: 2 host sống, 4 cổng mở.
+```
+
+Thứ tự các dòng tiến độ có thể khác thứ tự host vì các host được dò song song;
+kết quả quét vẫn được in theo thứ tự địa chỉ.
+
 ## Cách hoạt động
 
 Với mỗi cổng, chương trình mở một socket TCP và gọi `connect_ex()`. Hàm này
@@ -81,6 +117,22 @@ thực hiện TCP handshake (SYN → SYN/ACK → ACK) và trả về `0` khi k�
 công — nghĩa là có tiến trình đang lắng nghe trên cổng đó. Các mã lỗi như
 `ECONNREFUSED` (cổng đóng) hoặc timeout được coi là cổng không mở. Mỗi kết nối
 có timeout riêng nên chương trình không bị treo khi gói tin bị drop.
+
+## Quét CIDR và dò host sống
+
+Khi nhận CIDR, chương trình dùng `ipaddress` mở rộng dải thành danh sách host
+(bỏ địa chỉ mạng và broadcast khi có thể). CIDR có host bits sẽ được chuẩn hóa về
+địa chỉ mạng trước khi quét. Dải lớn hơn `/24` bị từ chối ngay, không hỏi lại.
+
+Trước khi quét toàn bộ dải cổng, chương trình thử TCP connect tới các cổng `80`,
+`443`, `445` với timeout ngắn (`--discovery-timeout`) để loại nhanh các host không
+phản hồi; chỉ host sống mới được quét kỹ. Cách này tránh quét toàn bộ cổng trên
+các địa chỉ không tồn tại, vốn rất tốn thời gian. Tiến độ được in theo dạng
+`[đã xong/tổng] host`. Host chỉ mở cổng nằm ngoài danh sách dò (ví dụ chỉ có SSH)
+có thể bị bỏ qua.
+
+Với một địa chỉ IP đơn lẻ, chương trình quét trực tiếp (không dò host) để không
+bỏ sót host chỉ mở cổng không nằm trong danh sách dò.
 
 ## Nhận diện dịch vụ và banner
 
@@ -96,8 +148,9 @@ không có banner; tên dịch vụ vẫn được hiển thị theo bảng ánh
 ## An toàn
 
 - Chỉ quét máy của bạn, mạng nhà bạn hoặc máy ảo lab.
-- Nếu mục tiêu nằm ngoài các dải nội bộ (`10.0.0.0/8`, `172.16.0.0/12`,
-  `192.168.0.0/16`, `127.0.0.0/8`), chương trình sẽ cảnh báo và yêu cầu xác
-  nhận trước khi quét.
+- Nếu mục tiêu (IP hoặc CIDR) nằm ngoài các dải nội bộ (`10.0.0.0/8`,
+  `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`), chương trình sẽ cảnh báo
+  và yêu cầu xác nhận trước khi quét.
+- Dải CIDR lớn hơn `/24` bị từ chối ngay, không hỏi lại.
 - Không có tính năng né tránh phát hiện (IDS evasion) hay quét tốc độ cao gây
   quá tải.

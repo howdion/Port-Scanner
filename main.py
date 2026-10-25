@@ -8,7 +8,7 @@ import math
 import sys
 import time
 
-from scanner import grab_banners, scan_ports
+from scanner import discover_hosts, grab_banners, scan_ports
 from services import get_service_name
 
 
@@ -29,14 +29,25 @@ def configure_output_encoding() -> None:
             reconfigure(encoding="utf-8")
 
 
-def parse_target(value: str) -> ipaddress.IPv4Address:
-    """Kiểm tra tham số mục tiêu là một địa chỉ IPv4 hợp lệ."""
+def parse_target(value: str) -> ipaddress.IPv4Address | ipaddress.IPv4Network:
+    """Kiểm tra tham số mục tiêu là IPv4 hoặc CIDR IPv4 tối đa /24."""
     try:
+        if "/" in value:
+            network = ipaddress.ip_network(value, strict=False)
+            if network.version != 4:
+                raise argparse.ArgumentTypeError("hiện chỉ hỗ trợ địa chỉ IPv4")
+            if network.prefixlen < 24:
+                raise argparse.ArgumentTypeError(
+                    "chỉ hỗ trợ dải CIDR tối đa /24; dải lớn hơn bị từ chối"
+                )
+            return network
+
         ip = ipaddress.ip_address(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(
-            f"địa chỉ IP không hợp lệ: {value!r}"
+            f"địa chỉ IP/CIDR không hợp lệ: {value!r}"
         ) from exc
+
     if ip.version != 4:
         raise argparse.ArgumentTypeError("hiện chỉ hỗ trợ địa chỉ IPv4")
     return ip
@@ -104,14 +115,20 @@ def positive_int(value: str) -> int:
     return number
 
 
-def is_internal(ip: ipaddress.IPv4Address) -> bool:
-    """Kiểm tra IP có thuộc dải nội bộ được phép quét hay không."""
-    return any(ip in network for network in _INTERNAL_NETWORKS)
+def is_internal(
+    target: ipaddress.IPv4Address | ipaddress.IPv4Network,
+) -> bool:
+    """Kiểm tra IP hoặc CIDR có nằm trong dải nội bộ được phép quét không."""
+    if isinstance(target, ipaddress.IPv4Network):
+        return any(target.subnet_of(network) for network in _INTERNAL_NETWORKS)
+    return any(target in network for network in _INTERNAL_NETWORKS)
 
 
-def confirm_external_target(ip: ipaddress.IPv4Address) -> bool:
-    """Cảnh báo và xin xác nhận trước khi quét IP ngoài dải nội bộ."""
-    print(f"CẢNH BÁO: {ip} không nằm trong dải IP nội bộ.")
+def confirm_external_target(
+    target: ipaddress.IPv4Address | ipaddress.IPv4Network,
+) -> bool:
+    """Cảnh báo và xin xác nhận trước khi quét mục tiêu ngoài dải nội bộ."""
+    print(f"CẢNH BÁO: {target} không nằm trong dải IP nội bộ.")
     print("Công cụ này chỉ dùng để quét máy của bạn, mạng nhà bạn hoặc máy ảo lab.")
     print("Chỉ tiếp tục nếu bạn có quyền quét mục tiêu này.")
     try:
@@ -122,18 +139,112 @@ def confirm_external_target(ip: ipaddress.IPv4Address) -> bool:
     return answer in {"y", "yes"}
 
 
+def format_port_line(port: int, banner: str | None) -> str:
+    """Định dạng một dòng kết quả cổng kèm tên dịch vụ và banner."""
+    line = f"  {port}/tcp  {get_service_name(port)}"
+    if banner:
+        line += f"  |  {banner}"
+    return line
+
+
+def scan_network(
+    network: ipaddress.IPv4Network,
+    args: argparse.Namespace,
+) -> int:
+    """Dò host sống rồi quét cổng từng host trong dải CIDR."""
+    hosts = [str(host) for host in network.hosts()]
+    print(
+        f"Đang kiểm tra host sống trong {network} "
+        f"({len(hosts)} host, timeout {args.discovery_timeout}s)..."
+    )
+
+    def report_progress(done: int, total: int, host: str, is_alive: bool) -> None:
+        status = "sống" if is_alive else "không phản hồi"
+        print(f"[{done}/{total}] {host}: {status}")
+
+    started = time.perf_counter()
+    try:
+        alive_hosts = discover_hosts(
+            hosts,
+            timeout=args.discovery_timeout,
+            workers=args.workers,
+            on_progress=report_progress,
+        )
+    except KeyboardInterrupt:
+        print("\nĐã hủy bởi người dùng.")
+        return 130
+    elapsed = time.perf_counter() - started
+
+    print(
+        f"\nTìm thấy {len(alive_hosts)}/{len(hosts)} host sống "
+        f"trong {elapsed:.2f} giây."
+    )
+    if not alive_hosts:
+        print("Không có host nào phản hồi; bỏ qua quét cổng.")
+        return 0
+
+    total_open_ports = 0
+    for index, host in enumerate(alive_hosts, start=1):
+        print(
+            f"\n[{index}/{len(alive_hosts)}] Đang quét {host} "
+            f"({len(args.ports)} cổng)..."
+        )
+        host_started = time.perf_counter()
+        try:
+            open_ports, errors = scan_ports(
+                host,
+                args.ports,
+                timeout=args.timeout,
+                workers=args.workers,
+            )
+            banners = grab_banners(
+                host,
+                open_ports,
+                timeout=args.banner_timeout,
+                workers=args.workers,
+            )
+        except KeyboardInterrupt:
+            print("\nĐã hủy bởi người dùng.")
+            return 130
+        host_elapsed = time.perf_counter() - host_started
+
+        if errors:
+            print(f"Cảnh báo: {len(errors)} cổng gặp lỗi mạng, ví dụ:")
+            for port, message in errors[:5]:
+                print(f"  {port}/tcp: {message}")
+
+        if open_ports:
+            print(f"Cổng mở trên {host}:")
+            for port in open_ports:
+                print(format_port_line(port, banners.get(port)))
+            total_open_ports += len(open_ports)
+        else:
+            print(f"Không tìm thấy cổng mở trên {host}.")
+
+        print(
+            f"Hoàn tất host {host}: {len(open_ports)} cổng mở "
+            f"trong {host_elapsed:.2f} giây."
+        )
+
+    print(
+        f"\nTổng cộng: {len(alive_hosts)} host sống, "
+        f"{total_open_ports} cổng mở."
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Tạo bộ phân tích tham số dòng lệnh."""
     parser = argparse.ArgumentParser(
-        description="Quét cổng TCP bằng TCP connect (chỉ hỗ trợ IPv4).",
+        description="Quét cổng TCP bằng TCP connect (IPv4 hoặc CIDR tối đa /24).",
     )
     parser.add_argument(
         "target",
         nargs="?",
         default=ipaddress.ip_address("127.0.0.1"),
         type=parse_target,
-        metavar="IP",
-        help="địa chỉ IPv4 cần quét (mặc định: 127.0.0.1)",
+        metavar="IP/CIDR",
+        help="địa chỉ IPv4 hoặc dải CIDR tối đa /24 (mặc định: 127.0.0.1)",
     )
     parser.add_argument(
         "--ports",
@@ -157,6 +268,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="thời gian chờ đọc banner cho mỗi cổng mở (mặc định: 0.5)",
     )
     parser.add_argument(
+        "--discovery-timeout",
+        default=0.3,
+        type=positive_float,
+        metavar="GIÂY",
+        help="thời gian chờ dò host sống trong CIDR (mặc định: 0.3)",
+    )
+    parser.add_argument(
         "--workers",
         default=100,
         type=positive_int,
@@ -170,11 +288,14 @@ def main() -> int:
     """Chạy chương trình và trả về mã thoát."""
     configure_output_encoding()
     args = build_parser().parse_args()
-    target: ipaddress.IPv4Address = args.target
+    target: ipaddress.IPv4Address | ipaddress.IPv4Network = args.target
 
     if not is_internal(target) and not confirm_external_target(target):
         print("Đã hủy quét.")
         return 1
+
+    if isinstance(target, ipaddress.IPv4Network):
+        return scan_network(target, args)
 
     print(
         f"Đang quét {target} với {len(args.ports)} cổng "
@@ -209,11 +330,7 @@ def main() -> int:
     if open_ports:
         print(f"Cổng mở trên {target}:")
         for port in open_ports:
-            line = f"  {port}/tcp  {get_service_name(port)}"
-            banner = banners.get(port)
-            if banner:
-                line += f"  |  {banner}"
-            print(line)
+            print(format_port_line(port, banners.get(port)))
     else:
         print(f"Không tìm thấy cổng mở trên {target}.")
 

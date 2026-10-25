@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import socket
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
@@ -27,6 +28,9 @@ _HTTP_PORTS = {80, 3000, 5000, 5357, 8000, 8008, 8080, 8081, 8888}
 
 # Các cổng TLS không trả banner dạng plaintext; cần handshake TLS riêng.
 _TLS_PORTS = {443, 465, 636, 990, 993, 995, 8443}
+
+# Cổng dùng để dò nhanh host còn sống trước khi quét toàn bộ dải cổng.
+DISCOVERY_PORTS: tuple[int, ...] = (80, 443, 445)
 
 
 def scan_port(host: str, port: int, timeout: float = 1.0) -> bool:
@@ -94,6 +98,69 @@ def scan_ports(
 
     open_ports.sort()
     return open_ports, errors
+
+
+def discover_host(
+    host: str,
+    ports: tuple[int, ...] = DISCOVERY_PORTS,
+    timeout: float = 0.3,
+) -> bool:
+    """Kiểm tra nhanh một host còn sống bằng TCP connect tới vài cổng phổ biến.
+
+    Quét toàn bộ dải cổng trên mọi host trong một dải CIDR rất tốn thời gian.
+    Thử trước vài cổng hay mở giúp loại nhanh các host không phản hồi; chỉ host
+    sống mới được quét kỹ.
+    """
+    for port in ports:
+        try:
+            if scan_port(host, port, timeout):
+                return True
+        except OSError:
+            # Lỗi mạng khi dò host: coi như không phản hồi và thử cổng tiếp theo.
+            continue
+    return False
+
+
+def discover_hosts(
+    hosts: list[str],
+    ports: tuple[int, ...] = DISCOVERY_PORTS,
+    timeout: float = 0.3,
+    workers: int = 100,
+    on_progress: Callable[[int, int, str, bool], None] | None = None,
+) -> list[str]:
+    """Dò song song các host còn sống trong danh sách.
+
+    Args:
+        hosts: Danh sách địa chỉ IPv4 cần dò.
+        ports: Các cổng dùng để thử kết nối.
+        timeout: Thời gian chờ tối đa cho mỗi lần thử (giây).
+        workers: Số luồng dò song song.
+        on_progress: Hàm callback nhận (đã xong, tổng, host, còn sống) sau mỗi host.
+
+    Returns:
+        Danh sách host sống, giữ nguyên thứ tự đầu vào.
+    """
+    if not hosts:
+        return []
+
+    statuses: dict[str, bool] = {}
+    max_workers = max(1, min(workers, len(hosts)))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(discover_host, host, ports, timeout): host
+            for host in hosts
+        }
+        for done, future in enumerate(as_completed(futures), start=1):
+            host = futures[future]
+            try:
+                is_alive = future.result()
+            except OSError:
+                is_alive = False
+            statuses[host] = is_alive
+            if on_progress is not None:
+                on_progress(done, len(hosts), host, is_alive)
+
+    return [host for host in hosts if statuses.get(host)]
 
 
 def _clean_banner(data: bytes, max_length: int = 120) -> str:
