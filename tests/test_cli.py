@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import ipaddress
 import json
 import shutil
 import sys
@@ -260,6 +261,64 @@ class BackwardCompatibilityTest(CliTestCase):
         text = help_output.getvalue()
         self.assertIn("discover", text)
         self.assertIn("scan", text)
+
+
+class ReportMetadataTest(unittest.TestCase):
+    """Metadata báo cáo: giữ `target` cũ và thêm `target_hosts` cho danh sách."""
+
+    def test_single_host_keeps_old_shape(self) -> None:
+        metadata = main.build_report_metadata(
+            [ipaddress.ip_address("127.0.0.1")], [135], [], 1.5
+        )
+
+        self.assertEqual(metadata["target"], "127.0.0.1")
+        self.assertEqual(metadata["target_hosts"], ["127.0.0.1"])
+        self.assertEqual(metadata["hosts_count"], 1)
+        self.assertEqual(metadata["port_range"], "135")
+        self.assertEqual(metadata["total_open_ports"], 0)
+        self.assertEqual(metadata["scan_duration_seconds"], 1.5)
+
+    def test_multi_host_adds_list_and_keeps_old_fields(self) -> None:
+        hosts = [
+            ipaddress.ip_address("127.0.0.1"),
+            ipaddress.ip_address("127.0.0.2"),
+        ]
+        metadata = main.build_report_metadata(hosts, [135, 445], [], 2.0)
+
+        self.assertEqual(metadata["target"], "2 host")
+        self.assertEqual(metadata["target_hosts"], ["127.0.0.1", "127.0.0.2"])
+        self.assertEqual(metadata["hosts_count"], 2)
+        self.assertEqual(metadata["port_range"], "135,445")
+        self.assertEqual(metadata["total_open_ports"], 0)
+
+
+class ReportFileTest(CliTestCase):
+    """`scan --output` ghi metadata chứa danh sách host thật."""
+
+    def test_scan_report_contains_target_hosts(self) -> None:
+        output = self.workdir / "report.json"
+        code, _ = self.invoke(
+            [
+                "scan",
+                "--hosts",
+                "127.0.0.1,127.0.0.2",
+                "--ports",
+                "135",
+                "--output",
+                str(output),
+            ],
+            open_ports=[135],
+        )
+
+        self.assertEqual(code, 0)
+        data = json.loads(output.read_text(encoding="utf-8"))
+        metadata = data["metadata"]
+        self.assertEqual(metadata["target"], "2 host")
+        self.assertEqual(metadata["target_hosts"], ["127.0.0.1", "127.0.0.2"])
+        self.assertEqual(metadata["hosts_count"], 2)
+        self.assertEqual(metadata["port_range"], "135")
+        self.assertEqual(metadata["total_open_ports"], 2)
+        self.assertEqual(len(data["results"]), 2)
 
 
 if __name__ == "__main__":

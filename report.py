@@ -37,6 +37,12 @@ def render_report(
     Hàm này dùng chung cho cả CLI (ghi file) và web (tải về), nhờ vậy định dạng
     báo cáo chỉ được định nghĩa ở một chỗ.
 
+    ``metadata`` do nơi gọi dựng bằng ``main.build_report_metadata``: ``target``
+    là nhãn hiển thị (một IP hoặc "N host"), ``target_hosts`` là danh sách host
+    thật đã quét, kèm ``hosts_count``, ``port_range``, ``total_open_ports`` và
+    ``scan_duration_seconds``. Web server thêm ``batches_completed`` và
+    ``batches_total``. Báo cáo CSV không có phần metadata, chỉ có các dòng kết quả.
+
     Raises:
         ValueError: Khi định dạng báo cáo không phải ``json`` hoặc ``csv``.
     """

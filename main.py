@@ -407,11 +407,8 @@ def parse_host_list(value: str) -> list[ipaddress.IPv4Address]:
     return list(dict.fromkeys(hosts))
 
 
-def load_hosts_file(path_value: str) -> tuple[list[ipaddress.IPv4Address], str]:
+def load_hosts_file(path_value: str) -> list[ipaddress.IPv4Address]:
     """Đọc danh sách host từ file JSON do `discover` tạo ra.
-
-    Returns:
-        Cặp (danh sách host, CIDR gốc nếu file có ghi).
 
     Raises:
         ValueError: Khi không đọc được file, JSON sai, hoặc host không hợp lệ.
@@ -448,8 +445,7 @@ def load_hosts_file(path_value: str) -> tuple[list[ipaddress.IPv4Address], str]:
         except ValueError as exc:
             raise ValueError(f"file host {path}: {exc}") from exc
 
-    cidr = data.get("cidr")
-    return list(dict.fromkeys(hosts)), cidr.strip() if isinstance(cidr, str) else ""
+    return list(dict.fromkeys(hosts))
 
 
 def format_port_line(port: int, banner: str | None) -> str:
@@ -558,9 +554,37 @@ def prepare_output_path(args: argparse.Namespace, kind: str) -> Path | None:
     return path
 
 
+def report_target_label(hosts: list[ipaddress.IPv4Address]) -> str:
+    """Nhãn mục tiêu cho báo cáo: một IP, hoặc "N host" khi quét danh sách."""
+    if len(hosts) == 1:
+        return str(hosts[0])
+    return f"{len(hosts)} host"
+
+
+def build_report_metadata(
+    hosts: list[ipaddress.IPv4Address],
+    ports: list[int],
+    records: list[ScanRecord],
+    duration: float,
+) -> dict:
+    """Metadata báo cáo quét cổng, dùng chung cho CLI và web server.
+
+    `target` giữ nguyên ý nghĩa cũ (nhãn hiển thị) để không phá định dạng đang
+    dùng; `target_hosts` là danh sách host thật đã quét.
+    """
+    return {
+        "target": report_target_label(hosts),
+        "target_hosts": [str(host) for host in hosts],
+        "hosts_count": len(hosts),
+        "port_range": format_port_spec(ports),
+        "total_open_ports": len(records),
+        "scan_duration_seconds": round(duration, 3),
+    }
+
+
 def save_report_if_requested(
     args: argparse.Namespace,
-    target: ipaddress.IPv4Address | ipaddress.IPv4Network | str,
+    hosts: list[ipaddress.IPv4Address],
     ports: list[int],
     records: list[ScanRecord],
     duration: float,
@@ -573,12 +597,7 @@ def save_report_if_requested(
     if path is None:
         return 1
 
-    metadata = {
-        "target": str(target),
-        "port_range": format_port_spec(ports),
-        "total_open_ports": len(records),
-        "scan_duration_seconds": round(duration, 3),
-    }
+    metadata = build_report_metadata(hosts, ports, records, duration)
 
     try:
         write_report(path, args.report_format, records, metadata)
@@ -731,7 +750,7 @@ def scan_one_host(host: ipaddress.IPv4Address, args: argparse.Namespace) -> int:
     print(f"\nHoàn tất: {len(open_ports)} cổng mở trong {elapsed:.2f} giây.")
 
     report_status = save_report_if_requested(
-        args, target, ports, records, elapsed
+        args, [host], ports, records, elapsed
     )
 
     if errors and not open_ports:
@@ -742,7 +761,6 @@ def scan_one_host(host: ipaddress.IPv4Address, args: argparse.Namespace) -> int:
 
 def scan_host_list(
     hosts: list[ipaddress.IPv4Address],
-    label: str,
     args: argparse.Namespace,
 ) -> int:
     """Giai đoạn 2 với danh sách host đã biết; KHÔNG dò host sống."""
@@ -802,13 +820,12 @@ def scan_host_list(
     elapsed = time.perf_counter() - started
     print(f"\nTổng cộng: {len(hosts)} host, {total_open_ports} cổng mở.")
 
-    report_status = save_report_if_requested(args, label, ports, records, elapsed)
+    report_status = save_report_if_requested(args, hosts, ports, records, elapsed)
     return 0 if report_status == 0 else 1
 
 
 def run_scan(
     hosts: list[ipaddress.IPv4Address],
-    label: str,
     args: argparse.Namespace,
 ) -> int:
     """Giai đoạn 2: kiểm tra giới hạn bằng số host THẬT rồi quét cổng."""
@@ -824,12 +841,12 @@ def run_scan(
 
     if len(hosts) == 1:
         return scan_one_host(hosts[0], args)
-    return scan_host_list(hosts, label, args)
+    return scan_host_list(hosts, args)
 
 
 def resolve_scan_targets(
     args: argparse.Namespace,
-) -> tuple[list[ipaddress.IPv4Address], str] | None:
+) -> list[ipaddress.IPv4Address] | None:
     """Xác định danh sách host của `scan`; None khi tham số không hợp lệ."""
     provided = [
         args.target is not None,
@@ -867,23 +884,20 @@ def resolve_scan_targets(
         ):
             print("Đã hủy quét.")
             return None
-        return [ip], str(ip)
+        return [ip]
 
     if args.hosts is not None:
         try:
-            hosts = parse_host_list(args.hosts)
+            return parse_host_list(args.hosts)
         except ValueError as exc:
             print(f"Lỗi: --hosts: {exc}")
             return None
-        return hosts, f"{len(hosts)} host từ --hosts"
 
     try:
-        hosts, cidr = load_hosts_file(args.hosts_file)
+        return load_hosts_file(args.hosts_file)
     except ValueError as exc:
         print(f"Lỗi: {exc}")
         return None
-    label = cidr or f"{len(hosts)} host từ {args.hosts_file}"
-    return hosts, label
 
 
 def add_discover_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -1103,11 +1117,10 @@ def handle_discover(args: argparse.Namespace) -> int:
 
 def handle_scan(args: argparse.Namespace) -> int:
     """Xử lý subcommand scan (và cả cách gọi cũ không có subcommand)."""
-    resolved = resolve_scan_targets(args)
-    if resolved is None:
+    hosts = resolve_scan_targets(args)
+    if hosts is None:
         return 1
-    hosts, label = resolved
-    return run_scan(hosts, label, args)
+    return run_scan(hosts, args)
 
 
 def main() -> int:
