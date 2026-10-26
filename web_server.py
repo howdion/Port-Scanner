@@ -37,6 +37,7 @@ from main import (
     STAGE_SCAN,
     WARN_ATTEMPTS,
     build_records,
+    build_report_metadata,
     configure_output_encoding,
     count_target_hosts,
     current_timestamp,
@@ -73,7 +74,9 @@ BATCH_SIZE = 2048
 MAX_CONCURRENCY = 100
 DEFAULT_CONCURRENCY = 100
 MAX_DISCOVERY_PORTS = 64
-MAX_BODY_BYTES = 65536
+# Giới hạn body đủ lớn cho danh sách host của một lần dò /18 (tối đa 16382 host,
+# khoảng 300 KB JSON); vẫn chặn mọi payload lớn hơn.
+MAX_BODY_BYTES = 1_048_576
 KEEP_JOBS = 20
 
 # Giá trị mặc định và khoảng hợp lệ cho các tham số nâng cao. Giá trị gửi từ
@@ -316,18 +319,23 @@ class ScanJob(BaseJob):
         """Metadata của báo cáo, tính tại thời điểm gọi.
 
         Nhờ vậy vẫn tải được báo cáo khi job đang chạy hoặc đã bị hủy, và số lô
-        đã hoàn thành luôn đúng với thời điểm tải.
+        đã hoàn thành luôn đúng với thời điểm tải. Dùng chung hàm với CLI để
+        định dạng báo cáo chỉ có một nguồn.
         """
         with self._lock:
-            return {
-                "target": self.target_label(),
-                "hosts_count": len(self.hosts),
-                "port_range": format_port_spec(self.ports),
-                "total_open_ports": len(self.records),
-                "scan_duration_seconds": round(self._duration_seconds(), 3),
-                "batches_completed": self.batches_completed,
-                "batches_total": self.batch_total,
-            }
+            metadata = build_report_metadata(
+                list(self.hosts),
+                self.ports,
+                list(self.records),
+                self._duration_seconds(),
+            )
+            metadata.update(
+                {
+                    "batches_completed": self.batches_completed,
+                    "batches_total": self.batch_total,
+                }
+            )
+            return metadata
 
     def snapshot(self) -> dict:
         """Bản chụp trạng thái để trả về qua API JSON."""

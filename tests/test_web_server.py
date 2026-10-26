@@ -826,6 +826,10 @@ class ScanResultTest(WebServerTestCase):
         self.assertEqual(
             document["metadata"]["total_open_ports"], len(document["results"])
         )
+        self.assertEqual(document["metadata"]["target"], "127.0.0.1")
+        self.assertEqual(document["metadata"]["target_hosts"], ["127.0.0.1"])
+        self.assertEqual(document["metadata"]["hosts_count"], 1)
+        self.assertIn("batches_total", document["metadata"])
         self.assertNotIn(b"Traceback", raw)
 
     def test_multi_host_scan_returns_all_hosts(self) -> None:
@@ -843,6 +847,20 @@ class ScanResultTest(WebServerTestCase):
             ["127.0.0.1", "127.0.0.2", "127.0.0.3"],
         )
         self.assertEqual(len(snapshot["results"]), 6)
+
+        # Báo cáo của lần quét nhiều host liệt kê đủ danh sách host.
+        status, _, raw = self.request(
+            "GET",
+            f"/api/scan/{job_id}/download?format=json",
+            headers=self.auth_headers,
+        )
+        self.assertEqual(status, 200)
+        metadata = json.loads(raw)["metadata"]
+        self.assertEqual(metadata["target"], "3 host")
+        self.assertEqual(
+            metadata["target_hosts"], ["127.0.0.1", "127.0.0.2", "127.0.0.3"]
+        )
+        self.assertEqual(metadata["hosts_count"], 3)
 
     def test_results_sorted_by_ip_then_port(self) -> None:
         with mock.patch.object(scanner, "scan_port", side_effect=self.fake_scan), \
