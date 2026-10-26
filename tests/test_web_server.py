@@ -352,12 +352,12 @@ class TargetRestrictionTest(WebServerTestCase):
                 parsed = web_server.parse_target(target)
                 self.assertTrue(web_server.is_internal(parsed))
 
-    def test_cidr_larger_than_slash_24_is_rejected(self) -> None:
-        for target in ("10.0.0.0/16", "192.168.0.0/23", "127.0.0.0/8"):
+    def test_cidr_larger_than_slash_18_is_rejected(self) -> None:
+        for target in ("10.0.0.0/17", "192.168.0.0/16", "127.0.0.0/8"):
             with self.subTest(target=target):
                 status, raw = self.post_scan(target, "80")
                 self.assertEqual(status, 400)
-                self.assertIn("/24", self.error_of(raw))
+                self.assertIn("/18", self.error_of(raw))
 
     def test_cidr_slash_24_at_boundary_is_accepted(self) -> None:
         # Dùng scan_port giả để không thật sự dò 254 host.

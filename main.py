@@ -23,6 +23,103 @@ _INTERNAL_NETWORKS = (
     ipaddress.ip_network("127.0.0.0/8"),
 )
 
+# Dải CIDR lớn nhất được phép: /18 (16382 host khả dụng). Lớn hơn /18 bị từ chối
+# ngay, không có cờ nào bỏ qua.
+CIDR_MIN_PREFIX = 18
+
+# Hai mốc giới hạn tổng số lượt quét của một job.
+# - vượt WARN_ATTEMPTS: phải xác nhận thêm (--confirm-large-scan, hoặc confirm
+#   trên web) mới chạy.
+# - vượt HARD_ATTEMPTS: từ chối hẳn, không có cách nào vượt qua.
+WARN_ATTEMPTS = 500_000
+HARD_ATTEMPTS = 5_000_000
+
+
+def count_target_hosts(
+    target: ipaddress.IPv4Address | ipaddress.IPv4Network,
+) -> int:
+    """Số host tối đa của mục tiêu, dùng để ước tính trước khi dò host sống."""
+    if isinstance(target, ipaddress.IPv4Network):
+        return sum(1 for _ in target.hosts())
+    return 1
+
+
+def estimate_job_attempts(
+    hosts: int,
+    ports_count: int,
+    discovery_count: int = 0,
+) -> int:
+    """Tổng số lượt quét dự kiến = số host × (cổng quét + cổng dò host).
+
+    Trước khi dò host sống thì dùng số host tối đa của CIDR; sau khi dò thì dùng
+    số host sống thực tế và không tính lại phần dò đã chạy xong. Đây là ước lượng
+    trên (mỗi host thử hết các cổng dò), đủ để chặn sớm.
+    """
+    return hosts * (ports_count + discovery_count)
+
+
+def estimate_scan_seconds(
+    hosts: int,
+    ports_count: int,
+    timeout: float,
+    discovery_count: int = 0,
+    discovery_timeout: float = 0.0,
+    workers: int = 1,
+) -> float:
+    """Ước tính thời gian quét tính bằng giây theo timeout và số luồng.
+
+    Mỗi lượt thử chờ tối đa `timeout` giây và có `workers` luồng chạy song song,
+    nên đây là ước lượng trường hợp xấu nhất (mọi kết nối đều hết thời gian chờ).
+    """
+    safe_workers = max(1, workers)
+    scan_seconds = hosts * ports_count * timeout / safe_workers
+    discovery_seconds = hosts * discovery_count * discovery_timeout / safe_workers
+    return discovery_seconds + scan_seconds
+
+
+def format_attempts(value: int) -> str:
+    """Định dạng số lượt theo kiểu Việt Nam (dấu chấm ngăn nghìn)."""
+    return f"{value:,}".replace(",", ".")
+
+
+def format_duration(seconds: float) -> str:
+    """Đổi số giây thành câu tiếng Việt dễ đọc."""
+    if seconds < 60:
+        return f"{seconds:.0f} giây"
+    minutes = seconds / 60
+    if minutes < 60:
+        return f"{minutes:.0f} phút"
+    hours = minutes / 60
+    if hours < 48:
+        return f"{hours:.1f} giờ"
+    return f"{hours / 24:.1f} ngày"
+
+
+def hard_limit_message(
+    hosts: int,
+    ports_count: int,
+    discovery_count: int = 0,
+) -> str:
+    """Thông báo khi vượt trần cứng số lượt quét."""
+    attempts = estimate_job_attempts(hosts, ports_count, discovery_count)
+    total_ports = ports_count + discovery_count
+    return (
+        f"Vượt trần cứng {format_attempts(HARD_ATTEMPTS)} lượt quét: ước tính "
+        f"{format_attempts(attempts)} lượt ({hosts} host × {total_ports} cổng). "
+        "Hãy giảm số cổng hoặc thu nhỏ dải CIDR."
+    )
+
+
+def large_scan_lines(attempts: int, seconds: float) -> list[str]:
+    """Các dòng cảnh báo khi vượt mốc phải xác nhận."""
+    return [
+        f"CẢNH BÁO: lần quét này ước tính {format_attempts(attempts)} lượt quét, "
+        f"vượt mốc {format_attempts(WARN_ATTEMPTS)} lượt.",
+        f"Thời gian ước tính khoảng {format_duration(seconds)} "
+        "(theo timeout và số luồng hiện tại).",
+        "Quét dải lớn có thể làm chậm mạng và dễ bị hệ thống an ninh phát hiện.",
+    ]
+
 
 def configure_output_encoding() -> None:
     """Ép stdout/stderr dùng UTF-8 để in tiếng Việt trên Windows."""
@@ -68,15 +165,16 @@ def stdin_is_interactive() -> bool:
 
 
 def parse_target(value: str) -> ipaddress.IPv4Address | ipaddress.IPv4Network:
-    """Kiểm tra tham số mục tiêu là IPv4 hoặc CIDR IPv4 tối đa /24."""
+    """Kiểm tra tham số mục tiêu là IPv4 hoặc CIDR IPv4 từ /18 đến /32."""
     try:
         if "/" in value:
             network = ipaddress.ip_network(value, strict=False)
             if network.version != 4:
                 raise argparse.ArgumentTypeError("hiện chỉ hỗ trợ địa chỉ IPv4")
-            if network.prefixlen < 24:
+            if network.prefixlen < CIDR_MIN_PREFIX:
                 raise argparse.ArgumentTypeError(
-                    "chỉ hỗ trợ dải CIDR tối đa /24; dải lớn hơn bị từ chối"
+                    f"chỉ hỗ trợ dải CIDR từ /{CIDR_MIN_PREFIX} đến /32; "
+                    f"dải lớn hơn /{CIDR_MIN_PREFIX} bị từ chối"
                 )
             return network
 
@@ -183,6 +281,34 @@ def confirm_external_target(
         answer = input("Tiếp tục quét? [y/N]: ").strip().lower()
     except EOFError:
         print("\nKhông nhận được xác nhận; cần --yes khi chạy không tương tác.")
+        return False
+    except (KeyboardInterrupt, OSError):
+        print("\nĐã hủy xác nhận.")
+        return False
+    return answer in {"y", "yes"}
+
+
+def confirm_large_scan(
+    attempts: int,
+    seconds: float,
+    assume_confirm: bool = False,
+) -> bool:
+    """Cảnh báo và xin xác nhận khi lần quét vượt mốc WARN_ATTEMPTS."""
+    for line in large_scan_lines(attempts, seconds):
+        print(line)
+
+    if assume_confirm:
+        print("Đã tự xác nhận bằng --confirm-large-scan.")
+        return True
+
+    if not stdin_is_interactive():
+        print("Cần --confirm-large-scan khi chạy không tương tác.")
+        return False
+
+    try:
+        answer = input("Tiếp tục quét lớn? [y/N]: ").strip().lower()
+    except EOFError:
+        print("\nKhông nhận được xác nhận; cần --confirm-large-scan.")
         return False
     except (KeyboardInterrupt, OSError):
         print("\nĐã hủy xác nhận.")
@@ -356,6 +482,19 @@ def scan_network(
         )
         return 1 if report_status != 0 else 0
 
+    # Ước tính lại bằng số host sống thực tế trước khi quét cổng.
+    alive_attempts = estimate_job_attempts(len(alive_hosts), len(args.ports))
+    if alive_attempts > HARD_ATTEMPTS:
+        print(f"LỖI: {hard_limit_message(len(alive_hosts), len(args.ports))}")
+        return 1
+    if alive_attempts > WARN_ATTEMPTS and not args.confirm_large_scan:
+        alive_seconds = estimate_scan_seconds(
+            len(alive_hosts), len(args.ports), args.timeout, workers=args.workers
+        )
+        if not confirm_large_scan(alive_attempts, alive_seconds):
+            print("Đã hủy quét.")
+            return 1
+
     total_open_ports = 0
     for index, host in enumerate(alive_hosts, start=1):
         print(
@@ -416,7 +555,10 @@ def scan_network(
 def build_parser() -> argparse.ArgumentParser:
     """Tạo bộ phân tích tham số dòng lệnh."""
     parser = argparse.ArgumentParser(
-        description="Quét cổng TCP bằng TCP connect (IPv4 hoặc CIDR tối đa /24).",
+        description=(
+            f"Quét cổng TCP bằng TCP connect (IPv4 hoặc CIDR từ "
+            f"/{CIDR_MIN_PREFIX} đến /32)."
+        ),
     )
     parser.add_argument(
         "target",
@@ -424,14 +566,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=ipaddress.ip_address("127.0.0.1"),
         type=parse_target,
         metavar="IP/CIDR",
-        help="địa chỉ IPv4 hoặc dải CIDR tối đa /24 (mặc định: 127.0.0.1)",
+        help=(
+            f"địa chỉ IPv4 hoặc dải CIDR từ /{CIDR_MIN_PREFIX} đến /32 "
+            "(mặc định: 127.0.0.1)"
+        ),
     )
     parser.add_argument(
         "--ports",
         default="1-1024",
         type=parse_ports,
         metavar="PORTS",
-        help="dải cổng, ví dụ 1-1024 hoặc 22,80,443 (mặc định: 1-1024)",
+        help=(
+            "dải cổng, ví dụ 1-1024 hoặc 22,80,443; tối đa 1-65535 "
+            "(mặc định: 1-1024)"
+        ),
     )
     parser.add_argument(
         "--timeout",
@@ -479,6 +627,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="tự xác nhận quét mục tiêu ngoài dải nội bộ",
     )
     parser.add_argument(
+        "--confirm-large-scan",
+        action="store_true",
+        help=(
+            "tự xác nhận khi lần quét vượt mốc "
+            f"{format_attempts(WARN_ATTEMPTS)} lượt"
+        ),
+    )
+    parser.add_argument(
         "--output",
         metavar="FILE",
         help="ghi báo cáo ra file; nếu chỉ ghi tên file thì đặt trong reports/",
@@ -505,7 +661,32 @@ def main() -> int:
         print("Đã hủy quét.")
         return 1
 
-    if isinstance(target, ipaddress.IPv4Network):
+    # Ước tính tổng lượt quét trước khi mở bất kỳ kết nối nào, dùng số host tối
+    # đa của dải (hoặc 1 với IP đơn) và cả cổng dò host.
+    is_network = isinstance(target, ipaddress.IPv4Network)
+    max_hosts = count_target_hosts(target)
+    discovery_count = len(args.discovery_ports) if is_network else 0
+    attempts = estimate_job_attempts(max_hosts, len(args.ports), discovery_count)
+    seconds = estimate_scan_seconds(
+        max_hosts,
+        len(args.ports),
+        args.timeout,
+        discovery_count,
+        args.discovery_timeout,
+        args.workers,
+    )
+
+    if attempts > HARD_ATTEMPTS:
+        print(f"LỖI: {hard_limit_message(max_hosts, len(args.ports), discovery_count)}")
+        return 1
+
+    if attempts > WARN_ATTEMPTS and not confirm_large_scan(
+        attempts, seconds, assume_confirm=args.confirm_large_scan
+    ):
+        print("Đã hủy quét.")
+        return 1
+
+    if is_network:
         return scan_network(target, args)
 
     print(

@@ -10,12 +10,16 @@ from pathlib import Path
 # Cho phép chạy kiểm thử từ bất kỳ thư mục nào.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from main import (  # noqa: E402
+    HARD_ATTEMPTS,
+    WARN_ATTEMPTS,
+    hard_limit_message,
+    parse_target,
+)
 from report import ScanRecord  # noqa: E402
 from web_server import (  # noqa: E402
     BATCH_SIZE,
-    MAX_ATTEMPTS,
     MAX_PORTS,
-    attempt_limit_message,
     chunk_ports,
     count_target_hosts,
     sort_records,
@@ -41,10 +45,6 @@ class ConstantsTest(unittest.TestCase):
 
     def test_max_ports(self) -> None:
         self.assertEqual(MAX_PORTS, 65535)
-
-    def test_max_attempts(self) -> None:
-        # 256 host × 1024 cổng
-        self.assertEqual(MAX_ATTEMPTS, 262144)
 
 
 class ChunkPortsTest(unittest.TestCase):
@@ -128,28 +128,40 @@ class CountTargetHostsTest(unittest.TestCase):
 
 
 class AttemptLimitTest(unittest.TestCase):
-    """Giới hạn tổng số lượt thử của một job."""
+    """Hai mốc giới hạn tổng số lượt quét của một job."""
 
-    def test_one_host_full_range_is_allowed(self) -> None:
-        self.assertLessEqual(1 * MAX_PORTS, MAX_ATTEMPTS)
+    def test_one_host_full_range_is_below_warning(self) -> None:
+        # IP đơn không có bước dò host, nên chỉ tính số cổng.
+        self.assertLess(1 * MAX_PORTS, WARN_ATTEMPTS)
 
-    def test_slash_24_with_1024_ports_is_allowed(self) -> None:
-        # Tương đương ví dụ 256 host × 1024 cổng.
-        self.assertLessEqual(254 * 1024, MAX_ATTEMPTS)
+    def test_slash_24_with_1024_ports_is_below_warning(self) -> None:
+        self.assertLess(254 * (5 + 1024), WARN_ATTEMPTS)
 
-    def test_slash_24_with_full_range_is_rejected(self) -> None:
-        self.assertGreater(254 * MAX_PORTS, MAX_ATTEMPTS)
+    def test_slash_24_with_2048_ports_needs_confirmation(self) -> None:
+        attempts = 254 * (5 + 2048)
+        self.assertGreater(attempts, WARN_ATTEMPTS)
+        self.assertLessEqual(attempts, HARD_ATTEMPTS)
 
-    def test_slash_24_with_2048_ports_is_rejected(self) -> None:
-        self.assertGreater(254 * 2048, MAX_ATTEMPTS)
+    def test_slash_24_with_full_range_exceeds_hard_cap(self) -> None:
+        self.assertGreater(254 * (5 + MAX_PORTS), HARD_ATTEMPTS)
+
+    def test_slash_18_with_full_range_exceeds_hard_cap(self) -> None:
+        self.assertGreater(16382 * (5 + MAX_PORTS), HARD_ATTEMPTS)
+
+    def test_warning_below_hard_cap(self) -> None:
+        self.assertLess(WARN_ATTEMPTS, HARD_ATTEMPTS)
 
     def test_message_mentions_limit_and_how_to_reduce(self) -> None:
-        message = attempt_limit_message(254, 65535)
-        self.assertIn(str(MAX_ATTEMPTS), message)
-        self.assertIn("254 host", message)
-        self.assertIn("65535 cổng", message)
+        message = hard_limit_message(16382, MAX_PORTS, 5)
+        self.assertIn("5.000.000", message)
+        self.assertIn("16382 host", message)
         self.assertIn("giảm số cổng", message)
         self.assertIn("thu nhỏ dải CIDR", message)
+
+    def test_slash_18_is_accepted_and_slash_17_is_not(self) -> None:
+        self.assertEqual(str(parse_target("10.0.0.0/18")), "10.0.0.0/18")
+        with self.assertRaises(Exception):
+            parse_target("10.0.0.0/17")
 
 
 class SortRecordsTest(unittest.TestCase):
