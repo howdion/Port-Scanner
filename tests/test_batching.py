@@ -12,9 +12,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from main import (  # noqa: E402
     HARD_ATTEMPTS,
+    STAGE_SCAN,
     WARN_ATTEMPTS,
-    hard_limit_message,
     parse_target,
+    stage_limit_message,
 )
 from report import ScanRecord  # noqa: E402
 from web_server import (  # noqa: E402
@@ -128,32 +129,39 @@ class CountTargetHostsTest(unittest.TestCase):
 
 
 class AttemptLimitTest(unittest.TestCase):
-    """Hai mốc giới hạn tổng số lượt quét của một job."""
+    """Hai mốc giới hạn được áp dụng riêng cho từng giai đoạn."""
 
     def test_one_host_full_range_is_below_warning(self) -> None:
-        # IP đơn không có bước dò host, nên chỉ tính số cổng.
+        # IP đơn chỉ có giai đoạn quét cổng, nên chỉ tính số cổng.
         self.assertLess(1 * MAX_PORTS, WARN_ATTEMPTS)
 
     def test_slash_24_with_1024_ports_is_below_warning(self) -> None:
-        self.assertLess(254 * (5 + 1024), WARN_ATTEMPTS)
+        self.assertLess(254 * 1024, WARN_ATTEMPTS)
 
     def test_slash_24_with_2048_ports_needs_confirmation(self) -> None:
-        attempts = 254 * (5 + 2048)
+        attempts = 254 * 2048
         self.assertGreater(attempts, WARN_ATTEMPTS)
         self.assertLessEqual(attempts, HARD_ATTEMPTS)
 
     def test_slash_24_with_full_range_exceeds_hard_cap(self) -> None:
-        self.assertGreater(254 * (5 + MAX_PORTS), HARD_ATTEMPTS)
+        self.assertGreater(254 * MAX_PORTS, HARD_ATTEMPTS)
 
     def test_slash_18_with_full_range_exceeds_hard_cap(self) -> None:
-        self.assertGreater(16382 * (5 + MAX_PORTS), HARD_ATTEMPTS)
+        self.assertGreater(16382 * MAX_PORTS, HARD_ATTEMPTS)
+
+    def test_discovery_stage_is_counted_separately(self) -> None:
+        # 16382 × 64 cổng dò = 1.048.448: vượt cảnh báo nhưng chưa tới trần.
+        discovery_attempts = 16382 * 64
+        self.assertGreater(discovery_attempts, WARN_ATTEMPTS)
+        self.assertLessEqual(discovery_attempts, HARD_ATTEMPTS)
 
     def test_warning_below_hard_cap(self) -> None:
         self.assertLess(WARN_ATTEMPTS, HARD_ATTEMPTS)
 
     def test_message_mentions_limit_and_how_to_reduce(self) -> None:
-        message = hard_limit_message(16382, MAX_PORTS, 5)
+        message = stage_limit_message(STAGE_SCAN, 16382, MAX_PORTS)
         self.assertIn("5.000.000", message)
+        self.assertIn("giai đoạn quét cổng", message)
         self.assertIn("16382 host", message)
         self.assertIn("giảm số cổng", message)
         self.assertIn("thu nhỏ dải CIDR", message)

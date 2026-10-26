@@ -8,9 +8,9 @@ song bằng thread pool. Với mỗi cổng mở, chương trình hiển thị t
 cổng. Kết quả có thể xuất ra báo cáo JSON/CSV.
 
 > Hiện tại: CLI quét IPv4 hoặc CIDR từ `/18` đến `/32`, tối đa 65535 cổng mỗi lần quét,
-> có hai mốc giới hạn tổng lượt quét (cảnh báo ở 500.000 và trần cứng 5.000.000), nhận
-> diện dịch vụ, banner, dò host sống, xuất báo cáo JSON/CSV, kèm giao diện web cục bộ.
-> Bước 1–5 đã hoàn thành.
+> có hai mốc giới hạn cho **từng giai đoạn** (dò host sống và quét cổng): cảnh báo ở
+> 500.000 và trần cứng 5.000.000 lượt, nhận diện dịch vụ, banner, dò host sống, xuất
+> báo cáo JSON/CSV, kèm giao diện web cục bộ. Bước 1–5 đã hoàn thành.
 
 ## Yêu cầu
 
@@ -61,10 +61,10 @@ python -m unittest discover tests
 - `tests/test_report.py`: dựng và ghi báo cáo JSON/CSV, xử lý ký tự đặc biệt trong banner.
 - `tests/test_web_server.py`: API của web server — token, Host/Origin, giới hạn mục tiêu,
   giới hạn số cổng và số luồng, hai lần quét cùng lúc, hủy quét, banner chứa HTML,
-  quét theo lô (chia lô, kết quả từng phần, hủy giữa các lô, giới hạn tổng lượt thử).
+  quét theo lô (chia lô, kết quả từng phần, hủy giữa các lô, giới hạn theo từng giai đoạn).
 - `tests/test_batching.py`: hàm chia lô cổng, đếm host của mục tiêu, sắp xếp kết quả theo IP.
-- `tests/test_limits.py`: hai mốc giới hạn tổng lượt quét, các hàm ước tính lượt và ước
-  tính thời gian, định dạng số/thời gian và thông báo lỗi.
+- `tests/test_limits.py`: hai mốc giới hạn cho từng giai đoạn, các hàm ước tính lượt và
+  ước tính thời gian, định dạng số/thời gian, thông báo lỗi và luồng kiểm tra của CLI.
 
 Mọi bài kiểm thử chỉ làm việc với `127.0.0.1`. Bài kiểm tra mục tiêu ngoài dải nội bộ
 dùng `mock` để khẳng định không có kết nối nào được mở ra ngoài loopback. Thư mục tạm
@@ -99,7 +99,7 @@ dưới, và các ví dụ kèm kết quả ở mục [Ví dụ chạy và kết
 | `--workers` | `100` | Số luồng quét song song. |
 | `--force` | không bật | Ghi đè file báo cáo đã tồn tại mà không hỏi. |
 | `--yes` | không bật | Tự xác nhận mục tiêu ngoài dải nội bộ (vẫn in cảnh báo). |
-| `--confirm-large-scan` | không bật | Tự xác nhận khi lần quét vượt mốc `500.000` lượt (vẫn in cảnh báo). |
+| `--confirm-large-scan` | không bật | Tự xác nhận cho giai đoạn vượt mốc `500.000` lượt (vẫn in cảnh báo). |
 | `--output` | không ghi file | Đường dẫn file báo cáo; nếu chỉ ghi tên file thì đặt trong `reports/`. |
 | `--format` | `json` | Định dạng báo cáo: `json` hoặc `csv` (chỉ dùng khi có `--output`). |
 
@@ -314,8 +314,11 @@ Giao diện gồm:
   `192.168.1.10` với prefix `24` sẽ gửi lên `192.168.1.10/24` và server chuẩn hóa
   thành `192.168.1.0/24`.
 - **Dòng xem trước** ngay dưới ô nhập, cập nhật khi gõ: `192.168.1.0/24 → 254 host,
-  từ 192.168.1.1 đến 192.168.1.254 · ≈ 261.366 lượt quét, khoảng 43 phút`. Phần
-  chuẩn hóa và đếm host được tính giống `ipaddress.ip_network(..., strict=False)`,
+  từ 192.168.1.1 đến 192.168.1.254`. Ngay dưới đó là **hai dòng ước tính riêng**, ví dụ:
+  `Lượt dò (ước tính): 1.270 · khoảng 4 giây` và `Lượt quét cổng (ước tính theo số host
+  tối đa): 260.096 · khoảng 43 phút`. Hai giai đoạn không bao giờ được cộng lại; mỗi
+  dòng tự đổi màu khi vượt mốc của chính nó (vàng: cần xác nhận, đỏ: vượt trần cứng).
+  Phần chuẩn hóa và đếm host được tính giống `ipaddress.ip_network(..., strict=False)`,
   phần ước tính giống công thức của server.
 - **Dải cổng** kèm ba chip bấm một lần để điền: `Phổ biến`, `1-1024`, `Web`; nhận
   tới `1-65535`.
@@ -335,10 +338,10 @@ Giao diện gồm:
 - **Quét** / **Hủy quét**; nhấn Enter trong ô nhập cũng bắt đầu quét. Trong lúc
   chạy, các ô nhập, chip, tùy chọn nâng cao và nút Quét bị vô hiệu hóa, chỉ nút Hủy
   còn bật.
-- **Cảnh báo quét lớn**: khi ước tính vượt `500.000` lượt, dòng xem trước chuyển
-  sang hộp cảnh báo màu nổi bật kèm nút **Xác nhận quét lớn và bắt đầu**. Nếu vượt
-  trần cứng `5.000.000` lượt, hộp cảnh báo nói rõ server sẽ từ chối và nút xác nhận
-  không hiện.
+- **Cảnh báo quét lớn**: khi một trong hai giai đoạn vượt `500.000` lượt, hộp cảnh
+  báo nổi bật hiện ra, nêu rõ **giai đoạn nào** vượt (dò host hay quét cổng) kèm nút
+  **Xác nhận quét lớn và bắt đầu**. Nếu giai đoạn nào vượt trần cứng `5.000.000` lượt,
+  hộp cảnh báo nói rõ server sẽ từ chối và nút xác nhận không hiện.
 - **Vùng tiến độ** (`aria-live="polite"`) hiển thị giai đoạn (dò host sống / quét
   cổng), lô đang chạy, số host đã xong, số cổng đã quét trên tổng số cổng của cả
   job và thời gian đã trôi qua.
@@ -381,7 +384,7 @@ Hằng số kích thước lô nằm ở một chỗ duy nhất trong `web_serve
 | Phương thức | Đường dẫn | Mô tả |
 | --- | --- | --- |
 | `GET` | `/` | Trang giao diện, kèm token của phiên. |
-| `POST` | `/api/scan` | Bắt đầu quét. Body JSON: `{"target": "...", "ports": "...", ...}`. Trả `202` kèm `id`, hoặc `202` kèm `confirmation_required: true` khi vượt mốc cảnh báo. Trường `target` là `"ip"` hoặc `"ip/prefix"`. |
+| `POST` | `/api/scan` | Bắt đầu quét. Body JSON: `{"target": "...", "ports": "...", ...}`. Trả `202` kèm `id`, hoặc `202` kèm `confirmation_required: true`, danh sách `stages` vượt mốc và `estimates` của từng giai đoạn khi có giai đoạn vượt mốc cảnh báo. Trường `target` là `"ip"` hoặc `"ip/prefix"`. |
 | `GET` | `/api/scan/<id>` | Trạng thái, tiến độ và kết quả của một lần quét. |
 | `POST` | `/api/scan/<id>/cancel` | Yêu cầu hủy lần quét đang chạy. |
 | `GET` | `/api/scan/<id>/download?format=json\|csv` | Tải báo cáo, dùng lại `report.py`. Tải được cả khi job đang chạy hoặc đã bị hủy: chỉ trả những kết quả đã có. |
@@ -435,7 +438,8 @@ mục tiêu ngoài dải nội bộ, `404` id không tồn tại, `409` đang c�
     **không có** cơ chế xác nhận để quét mục tiêu ngoài;
   - CIDR lớn hơn `/18` bị từ chối;
   - tối đa `65535` cổng mỗi job, chia thành các lô `2048` cổng;
-  - hai mốc giới hạn tổng lượt quét (xem mục "Hai mốc giới hạn" bên dưới);
+  - hai mốc giới hạn áp dụng riêng cho từng giai đoạn (xem mục "Hai mốc giới hạn
+    cho từng giai đoạn" bên dưới);
   - tối đa `100` luồng; các timeout do server kiểm tra lại theo khoảng cho phép
     (`0.05`–`10` giây) dù giao diện gửi lên giá trị nào.
 - Chống bị trang web khác lợi dụng: kiểm tra header `Host` (chỉ nhận
@@ -448,27 +452,40 @@ mục tiêu ngoài dải nội bộ, `404` id không tồn tại, `409` đang c�
 - Mọi dữ liệu hiển thị (banner, tên dịch vụ) được chèn bằng `textContent`, không
   bao giờ gán chuỗi HTML — banner do máy bị quét kiểm soát nên có thể chứa mã độc.
 
-## Hai mốc giới hạn tổng lượt quét
+## Hai mốc giới hạn cho từng giai đoạn
 
-Một lần quét được ước tính bằng **tổng số lượt quét**:
+Một lần quét CIDR có hai giai đoạn, và mỗi giai đoạn được đánh giá **độc lập**:
 
 ```text
-trước khi dò host sống:  số host tối đa của dải × (số cổng quét + số cổng dò host)
-sau khi dò host sống:    số host sống thực tế   ×  số cổng quét
+giai đoạn 1 — dò host sống:  số host tối đa của dải × số cổng dò host
+giai đoạn 2 — quét cổng:     số host tối đa của dải × số cổng quét   (ước tính trước khi chạy)
+                             số host sống thực tế   × số cổng quét   (kiểm tra thật sau khi dò)
 ```
 
-Ví dụ: `/18` có 16382 host, nên `/18` × `1-65535` ước tính khoảng
-`16382 × 65540 ≈ 1,07 tỷ` lượt. Một IP đơn không có bước dò host nên chỉ tính
-`1 × số cổng`.
+Hai con số này **không bao giờ được cộng lại**: giai đoạn dò được so với hai mốc bằng
+con số của riêng nó, giai đoạn quét cũng vậy. Một IP đơn không có giai đoạn dò, chỉ có
+giai đoạn quét với số host bằng `1` (`1 × số cổng`).
 
-| Mốc | Giá trị | Hành vi |
+Ví dụ với `127.0.0.0/18`, cổng `1-1024`, 5 cổng dò mặc định:
+
+- dò host: `16382 × 5 = 81.910` lượt — dưới mốc cảnh báo nên giai đoạn này được chạy;
+- quét cổng (ước tính): `16382 × 1024 = 16.775.168` lượt — vượt trần cứng nên bị từ
+  chối **ngay từ đầu**, không cần đợi dò xong, và thông báo nêu rõ đây là giai đoạn
+  quét cổng vượt chứ không phải giai đoạn dò.
+
+| Mốc | Giá trị | Hành vi cho **mỗi giai đoạn** |
 | --- | --- | --- |
-| Cảnh báo | `500.000` lượt | CLI in cảnh báo kèm ước tính thời gian và yêu cầu `--confirm-large-scan` (hoặc trả lời `y` khi chạy tương tác). Web trả `202` kèm `confirmation_required: true` và **chưa chạy gì**; phải gọi lại với `"confirm": true`. |
-| Trần cứng | `5.000.000` lượt | Từ chối hẳn: CLI báo lỗi và thoát khác `0`, web trả `400`. **Không có cờ nào vượt qua**, và không mở kết nối nào trước khi từ chối. |
+| Cảnh báo | `500.000` lượt | CLI in cảnh báo nêu tên giai đoạn, kèm ước tính thời gian và yêu cầu `--confirm-large-scan` (hoặc trả lời `y` khi chạy tương tác). Web trả `202` kèm `confirmation_required: true` và danh sách `stages` vượt mốc, **chưa chạy gì**; phải gọi lại với `"confirm": true`. |
+| Trần cứng | `5.000.000` lượt | Từ chối hẳn: CLI báo lỗi nêu tên giai đoạn và thoát khác `0`, web trả `400`. **Không có cờ nào vượt qua**, và không mở kết nối nào trước khi từ chối. |
 
-Thông báo khi vượt trần nêu rõ cách giảm: bớt số cổng hoặc thu nhỏ dải CIDR.
-Ước tính thời gian dùng công thức `số lượt × timeout / số luồng`, tức trường hợp
-xấu nhất khi mọi kết nối đều hết thời gian chờ.
+Sau khi dò host sống xong, giai đoạn quét cổng được kiểm tra lại bằng số host sống
+thực tế. Nếu vượt trần cứng ở bước này, job dừng với trạng thái lỗi và thông báo nêu
+rõ số host sống thực tế (khác với ước tính ban đầu theo số host tối đa). Trong thực tế
+bước này hiếm khi kích hoạt vì ước tính theo số host tối đa đã là trường hợp lớn nhất.
+
+Thông báo khi vượt trần nêu rõ cách giảm: bớt số cổng, bớt cổng dò host, hoặc thu nhỏ
+dải CIDR. Ước tính thời gian dùng công thức `số lượt × timeout / số luồng`, tức trường
+hợp xấu nhất khi mọi kết nối đều hết thời gian chờ.
 
 > **Rủi ro khi quét dải lớn.** Quét vài chục nghìn host × vài chục nghìn cổng có
 > thể làm chậm mạng của bạn, chiếm nhiều kết nối đồng thời, và rất dễ bị hệ thống
@@ -485,9 +502,9 @@ xấu nhất khi mọi kết nối đều hết thời gian chờ.
   và yêu cầu xác nhận trước khi quét; dùng `--yes` khi chạy không tương tác và
   chỉ khi bạn có quyền quét.
 - Dải CIDR lớn hơn `/18` bị từ chối ngay, không hỏi lại.
-- Lần quét vượt `500.000` lượt phải được xác nhận thêm (`--confirm-large-scan`
-  trên CLI, hoặc bước xác nhận riêng trên web); vượt `5.000.000` lượt bị từ chối
-  hẳn, không có cách vượt qua.
+- Mỗi giai đoạn vượt `500.000` lượt phải được xác nhận thêm (`--confirm-large-scan`
+  trên CLI, hoặc bước xác nhận riêng trên web); giai đoạn nào vượt `5.000.000` lượt
+  bị từ chối hẳn, không có cách vượt qua.
 - Quét cổng trên hệ thống không thuộc quyền của bạn khi chưa được phép có thể vi phạm pháp luật.
 - Web server chỉ lắng nghe trên `127.0.0.1`; nếu cần dùng từ máy khác thì phải tự
   cân nhắc rủi ro, không mở rộng địa chỉ bind trong công cụ này.

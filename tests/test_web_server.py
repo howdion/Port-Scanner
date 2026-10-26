@@ -10,6 +10,7 @@ Chạy:
 from __future__ import annotations
 
 import http.client
+import ipaddress
 import json
 import secrets
 import socket
@@ -23,6 +24,7 @@ from unittest import mock
 # Cho phép chạy kiểm thử từ bất kỳ thư mục nào.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import main  # noqa: E402
 import scanner  # noqa: E402
 import web_server  # noqa: E402
 
@@ -571,16 +573,19 @@ class LargeScanConfirmationTest(WebServerTestCase):
             self.wait_done(snapshot["id"], timeout=60)
 
     def test_above_warning_requires_confirmation(self) -> None:
-        # /24 × 2048 cổng = 254 × 2053 = 521.462 lượt: vượt mốc, dưới trần cứng.
+        # /24 × 2048 cổng: giai đoạn quét cổng = 254 × 2048 = 520.192 lượt,
+        # vượt mốc cảnh báo nhưng dưới trần cứng; giai đoạn dò chỉ 1.270 lượt.
         status, raw = self.post_scan("127.0.0.0/24", "1-2048")
         self.assertEqual(status, 202)
         payload = json.loads(raw)
         self.assertTrue(payload["confirmation_required"])
         self.assertNotIn("id", payload, "chưa được tạo job nào")
+        self.assertEqual(payload["stages"], ["scan"])
         self.assertEqual(payload["warn_threshold"], web_server.WARN_ATTEMPTS)
         self.assertEqual(payload["hard_threshold"], web_server.HARD_ATTEMPTS)
-        self.assertGreater(payload["estimated_attempts"], web_server.WARN_ATTEMPTS)
-        self.assertLessEqual(payload["estimated_attempts"], web_server.HARD_ATTEMPTS)
+        self.assertEqual(payload["estimates"]["scan"]["attempts"], 254 * 2048)
+        self.assertEqual(payload["estimates"]["discovery"]["attempts"], 254 * 5)
+        self.assertIn("giai đoạn quét cổng", payload["message"])
         self.assertIn("mốc", payload["message"])
 
         # Chưa có job nào chạy -> yêu cầu khác vẫn được nhận.
@@ -692,6 +697,98 @@ class AdvancedParamsTest(WebServerTestCase):
             self.assertNotIn("confirmation_required", snapshot)
             self.cancel_if_running(snapshot["id"])
             self.wait_done(snapshot["id"], timeout=60)
+
+
+class StageLimitSeparationTest(WebServerTestCase):
+    """Giới hạn của giai đoạn dò host và giai đoạn quét cổng là độc lập."""
+
+    def test_image_case_rejects_the_scan_stage_only(self) -> None:
+        # 127.0.0.0/18 × 1-1024, 5 cổng dò, mốc cảnh báo = trần cứng = 500.000.
+        # - dò host: 16.382 × 5 = 81.910  -> được phép chạy
+        # - quét cổng (ước tính theo host tối đa): 16.382 × 1.024 = 16.775.168
+        #   -> vượt trần cứng ngay ở bước ước tính, không cần dò xong.
+        calls: list[tuple[str, int]] = []
+
+        def spy(host: str, port: int, timeout: float = 1.0) -> bool:
+            calls.append((host, port))
+            return False
+
+        with mock.patch.object(main, "HARD_ATTEMPTS", 500_000), \
+                mock.patch.object(main, "WARN_ATTEMPTS", 500_000), \
+                mock.patch.object(web_server, "HARD_ATTEMPTS", 500_000), \
+                mock.patch.object(web_server, "WARN_ATTEMPTS", 500_000), \
+                mock.patch.object(scanner, "scan_port", side_effect=spy):
+            status, raw = self.post_scan("127.0.0.0/18", "1-1024")
+
+        self.assertEqual(status, 400)
+        message = self.error_of(raw)
+        self.assertIn("giai đoạn quét cổng", message)
+        self.assertIn("16.775.168", message)
+        self.assertIn("500.000", message)
+        self.assertNotIn("dò host sống", message)
+        self.assertEqual(calls, [], "không được mở kết nối nào trước khi từ chối")
+        self.assertIsNone(self.manager.running_job())
+
+        # Server vẫn nhận lần quét mới sau khi từ chối.
+        status2, raw2 = self.post_scan("127.0.0.1", "135")
+        self.assertEqual(status2, 202)
+        self.wait_done(json.loads(raw2)["id"])
+
+    def test_discovery_stage_can_warn_on_its_own(self) -> None:
+        # 16.382 × 64 = 1.048.448 lượt dò: vượt mốc cảnh báo, chưa tới trần
+        # cứng. Giai đoạn quét cổng chỉ 16.382 × 1 = 16.382 lượt.
+        discovery_ports = ",".join(str(port) for port in range(1000, 1064))
+        status, raw = self.post_scan(
+            "127.0.0.0/18", "80", discovery_ports=discovery_ports
+        )
+
+        self.assertEqual(status, 202)
+        payload = json.loads(raw)
+        self.assertTrue(payload["confirmation_required"])
+        self.assertNotIn("id", payload, "chưa được tạo job nào")
+        self.assertEqual(payload["stages"], ["discovery"])
+        self.assertEqual(
+            payload["estimates"]["discovery"]["attempts"], 16382 * 64
+        )
+        self.assertEqual(payload["estimates"]["scan"]["attempts"], 16382)
+        self.assertIn("giai đoạn dò host sống", payload["message"])
+        self.assertIsNone(self.manager.running_job())
+
+    def test_post_discovery_check_uses_actual_alive_hosts(self) -> None:
+        # Ước tính ban đầu dùng host tối đa; sau khi dò phải kiểm tra lại bằng
+        # số host sống thực tế. Dùng run_scan trực tiếp với ngưỡng nhỏ để dựng
+        # đúng nhánh này (trong thực tế ước tính đã chặn trước đó).
+        job = web_server.ScanJob(ipaddress.ip_network("127.0.0.0/24"), [80])
+        alive = [f"127.0.0.{index}" for index in range(1, 255)]
+
+        with mock.patch.object(web_server, "HARD_ATTEMPTS", 100), \
+                mock.patch.object(web_server, "WARN_ATTEMPTS", 50), \
+                mock.patch.object(web_server, "discover_hosts", return_value=alive), \
+                mock.patch.object(web_server, "scan_ports") as scan_ports_mock:
+            web_server.run_scan(job)
+
+        self.assertEqual(job.status, "error")
+        self.assertIn("Sau khi dò host sống", job.message)
+        self.assertIn("254 host sống", job.message)
+        self.assertIn("giai đoạn quét cổng", job.message)
+        self.assertIn("254 lượt", job.message)
+        scan_ports_mock.assert_not_called()
+
+    def test_post_discovery_warning_is_satisfied_by_confirmation(self) -> None:
+        job = web_server.ScanJob(
+            ipaddress.ip_network("127.0.0.0/24"), [80], confirmed_large_scan=True
+        )
+        alive = [f"127.0.0.{index}" for index in range(1, 255)]
+
+        with mock.patch.object(web_server, "HARD_ATTEMPTS", 10_000), \
+                mock.patch.object(web_server, "WARN_ATTEMPTS", 50), \
+                mock.patch.object(web_server, "discover_hosts", return_value=alive), \
+                mock.patch.object(web_server, "scan_ports", return_value=([], [])), \
+                mock.patch.object(web_server, "grab_banners", return_value={}):
+            web_server.run_scan(job)
+
+        self.assertEqual(job.status, "done")
+        self.assertNotIn("vượt mốc", job.message)
 
 
 class SingleScanAtATimeTest(WebServerTestCase):

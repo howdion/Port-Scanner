@@ -26,21 +26,24 @@ from urllib.parse import parse_qs, urlparse
 
 from main import (
     HARD_ATTEMPTS,
+    STAGE_DISCOVERY,
+    STAGE_LABELS,
+    STAGE_SCAN,
     WARN_ATTEMPTS,
     build_records,
     configure_output_encoding,
     count_target_hosts,
     current_timestamp,
-    estimate_job_attempts,
-    estimate_scan_seconds,
+    estimate_stage_attempts,
+    estimate_stage_seconds,
     format_attempts,
     format_duration,
     format_port_spec,
-    hard_limit_message,
     is_internal,
-    large_scan_lines,
     parse_ports,
     parse_target,
+    stage_limit_message,
+    stage_warning_lines,
 )
 from report import ScanRecord, render_report
 from scanner import DISCOVERY_PORTS, discover_hosts, grab_banners, scan_ports
@@ -328,22 +331,29 @@ def run_scan(job: ScanJob) -> None:
                 )
                 return
 
-            # Kiểm tra lại hai mốc giới hạn bằng số host sống thực tế.
-            attempts = estimate_job_attempts(len(targets), len(job.ports))
+            # Kiểm tra thật giai đoạn quét cổng bằng số host sống thực tế. Đây là
+            # phép so sánh độc lập của giai đoạn quét, không cộng lượt dò host.
+            attempts = estimate_stage_attempts(len(targets), len(job.ports))
             if attempts > HARD_ATTEMPTS:
                 finish_job(
                     job,
                     "error",
-                    hard_limit_message(len(targets), len(job.ports)),
+                    "Sau khi dò host sống: "
+                    f"{len(targets)} host sống × {len(job.ports)} cổng = "
+                    f"{format_attempts(attempts)} lượt, vượt trần cứng "
+                    f"{format_attempts(HARD_ATTEMPTS)} ở "
+                    f"{STAGE_LABELS[STAGE_SCAN]}. Dừng trước khi quét cổng.",
                 )
                 return
             if attempts > WARN_ATTEMPTS and not job.confirmed_large_scan:
                 finish_job(
                     job,
                     "error",
-                    "Lần quét ước tính "
+                    "Sau khi dò host sống: "
+                    f"{len(targets)} host sống × {len(job.ports)} cổng = "
                     f"{format_attempts(attempts)} lượt, vượt mốc "
-                    f"{format_attempts(WARN_ATTEMPTS)}. Hãy chạy lại và xác nhận "
+                    f"{format_attempts(WARN_ATTEMPTS)} ở "
+                    f"{STAGE_LABELS[STAGE_SCAN]}. Hãy chạy lại và xác nhận "
                     "quét lớn, hoặc giảm số cổng / thu nhỏ dải CIDR.",
                 )
                 return
@@ -832,41 +842,76 @@ class ScanRequestHandler(BaseHTTPRequestHandler):
         discovery_ports = _optional_discovery_ports(data)
         confirmed = _optional_bool(data, "confirm")
 
-        # Ước tính tổng lượt quét trước khi mở bất kỳ kết nối nào: dùng số host
-        # tối đa của dải (hoặc 1 với IP đơn) và cả cổng dò host.
+        # Mỗi giai đoạn được đánh giá ĐỘC LẬP: không cộng lượt dò host với lượt
+        # quét cổng để so với một trần chung.
         is_network = isinstance(target, ipaddress.IPv4Network)
         max_hosts = count_target_hosts(target)
-        discovery_count = len(discovery_ports) if is_network else 0
-        attempts = estimate_job_attempts(max_hosts, len(ports), discovery_count)
-        seconds = estimate_scan_seconds(
-            max_hosts,
-            len(ports),
-            timeout,
-            discovery_count,
-            discovery_timeout,
-            workers,
-        )
 
-        # Trần cứng: từ chối hẳn, không có cách nào vượt qua.
-        if attempts > HARD_ATTEMPTS:
+        estimates: dict[str, dict] = {}
+        if is_network:
+            discovery_count = len(discovery_ports)
+            discovery_seconds = estimate_stage_seconds(
+                max_hosts, discovery_count, discovery_timeout, workers
+            )
+            estimates[STAGE_DISCOVERY] = {
+                "stage": STAGE_DISCOVERY,
+                "label": STAGE_LABELS[STAGE_DISCOVERY],
+                "hosts": max_hosts,
+                "ports": discovery_count,
+                "attempts": estimate_stage_attempts(max_hosts, discovery_count),
+                "seconds": round(discovery_seconds, 1),
+                "duration": format_duration(discovery_seconds),
+            }
+
+        scan_seconds = estimate_stage_seconds(
+            max_hosts, len(ports), timeout, workers
+        )
+        estimates[STAGE_SCAN] = {
+            "stage": STAGE_SCAN,
+            "label": STAGE_LABELS[STAGE_SCAN],
+            "hosts": max_hosts,
+            "ports": len(ports),
+            "attempts": estimate_stage_attempts(max_hosts, len(ports)),
+            "seconds": round(scan_seconds, 1),
+            "duration": format_duration(scan_seconds),
+        }
+
+        # Trần cứng: giai đoạn nào vượt thì từ chối ngay và nêu rõ giai đoạn đó.
+        for stage in (STAGE_DISCOVERY, STAGE_SCAN):
+            info = estimates.get(stage)
+            if info is None or info["attempts"] <= HARD_ATTEMPTS:
+                continue
             raise ApiError(
                 400,
-                hard_limit_message(max_hosts, len(ports), discovery_count),
+                stage_limit_message(stage, info["hosts"], info["ports"]),
             )
 
-        # Mốc cảnh báo: trả về một bước xác nhận riêng, chưa chạy gì cả.
-        if attempts > WARN_ATTEMPTS and not confirmed:
+        # Mốc cảnh báo: trả về bước xác nhận riêng, chỉ nêu các giai đoạn vượt
+        # mốc. Giai đoạn vượt trần cứng đã bị từ chối ở trên nên không tới đây.
+        over_warning = [
+            info
+            for info in estimates.values()
+            if info["attempts"] > WARN_ATTEMPTS
+        ]
+        if over_warning and not confirmed:
+            lines: list[str] = []
+            for info in over_warning:
+                lines.extend(
+                    stage_warning_lines(
+                        info["stage"], info["attempts"], info["seconds"]
+                    )
+                )
             self._send_json(
                 202,
                 {
                     "confirmation_required": True,
                     "reason": "large_scan",
-                    "message": " ".join(large_scan_lines(attempts, seconds)),
-                    "target": str(target),
-                    "ports": format_port_spec(ports),
-                    "estimated_attempts": attempts,
-                    "estimated_seconds": round(seconds, 1),
-                    "estimated_duration": format_duration(seconds),
+                    "message": " ".join(lines),
+                    "stages": [info["stage"] for info in over_warning],
+                    "estimates": {
+                        STAGE_DISCOVERY: estimates.get(STAGE_DISCOVERY),
+                        STAGE_SCAN: estimates[STAGE_SCAN],
+                    },
                     "warn_threshold": WARN_ATTEMPTS,
                     "hard_threshold": HARD_ATTEMPTS,
                 },
@@ -992,9 +1037,10 @@ def main() -> int:
     print(f"Chỉ lắng nghe trên {BIND_HOST}:{server.server_port} (không vào được từ mạng LAN).")
     print(
         f"Giới hạn: tối đa {MAX_PORTS} cổng mỗi lần quét, chia thành các lô "
-        f"{BATCH_SIZE} cổng; cảnh báo khi vượt {format_attempts(WARN_ATTEMPTS)} "
-        f"lượt và từ chối khi vượt {format_attempts(HARD_ATTEMPTS)} lượt "
-        f"(host × cổng); chỉ mục tiêu trong dải nội bộ."
+        f"{BATCH_SIZE} cổng; giai đoạn dò host và giai đoạn quét cổng được đánh "
+        f"giá độc lập: cảnh báo khi vượt {format_attempts(WARN_ATTEMPTS)} lượt "
+        f"và từ chối khi vượt {format_attempts(HARD_ATTEMPTS)} lượt mỗi giai "
+        "đoạn; chỉ mục tiêu trong dải nội bộ."
     )
     print("Nhấn Ctrl+C để dừng.")
 

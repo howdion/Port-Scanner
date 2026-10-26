@@ -22,6 +22,7 @@
     --danger: #b3261e;
     --danger-bg: #fdf1f0;
     --danger-border: #f0c2be;
+    --warn: #8a5300;
     --chip-bg: #eef1f4;
     --chip-hover: #e2e7ee;
     --track: #e5e9ee;
@@ -43,6 +44,7 @@
       --danger: #ff9d95;
       --danger-bg: #2b1a19;
       --danger-border: #663a35;
+      --warn: #f0c674;
       --chip-bg: #222c39;
       --chip-hover: #2c3846;
       --track: #222c39;
@@ -160,6 +162,11 @@
   }
   .advanced-grid .hint { margin: 0; }
   .advanced-grid code { font-size: 12px; }
+
+  .stage-estimates { display: grid; gap: 3px; margin-top: 4px; }
+  .stage-line { margin: 0; font-size: 13px; color: var(--muted); }
+  .stage-line.stage-warn { color: var(--warn); font-weight: 600; }
+  .stage-line.stage-error { color: var(--danger); font-weight: 600; }
 
   .large-scan {
     margin-top: 10px;
@@ -334,6 +341,10 @@
         </div>
         <p id="ip-error" class="field-error" role="alert" hidden></p>
         <p id="cidr-preview" class="hint"></p>
+        <div id="stage-estimates" class="stage-estimates" hidden>
+          <p id="discovery-estimate" class="stage-line" hidden></p>
+          <p id="scan-estimate" class="stage-line" hidden></p>
+        </div>
         <div id="large-scan-box" class="large-scan" hidden>
           <p id="large-scan-text" class="large-scan-text"></p>
           <button id="confirm-large" type="button" class="secondary">Xác nhận quét lớn và bắt đầu</button>
@@ -721,20 +732,15 @@
     return (hours / 24).toFixed(1) + " ngày";
   }
 
-  function estimateAttempts(hostCount, portCount, discoveryCount) {
-    // Giống estimate_job_attempts của server: host × (cổng quét + cổng dò).
-    return hostCount * (portCount + discoveryCount);
+  function stageAttempts(hostCount, portsCount) {
+    // Giống estimate_stage_attempts của server: CHỈ tính một giai đoạn,
+    // không cộng lượt dò host với lượt quét cổng.
+    return hostCount * portsCount;
   }
 
-  function estimateSeconds(
-    hostCount, portCount, timeout, discoveryCount, discoveryTimeout, workers
-  ) {
-    // Giống estimate_scan_seconds: trường hợp xấu nhất, mọi kết nối hết timeout.
-    var safeWorkers = Math.max(1, workers);
-    return (
-      (hostCount * portCount * timeout) / safeWorkers +
-      (hostCount * discoveryCount * discoveryTimeout) / safeWorkers
-    );
+  function stageSeconds(hostCount, portsCount, timeout, workers) {
+    // Giống estimate_stage_seconds: trường hợp xấu nhất, mọi kết nối hết timeout.
+    return (hostCount * portsCount * timeout) / Math.max(1, workers);
   }
 
   function targetHostCount(check) {
@@ -752,6 +758,9 @@
     prefix: document.getElementById("prefix"),
     ipError: document.getElementById("ip-error"),
     preview: document.getElementById("cidr-preview"),
+    stageEstimates: document.getElementById("stage-estimates"),
+    discoveryEstimate: document.getElementById("discovery-estimate"),
+    scanEstimate: document.getElementById("scan-estimate"),
     ports: document.getElementById("ports"),
     timeout: document.getElementById("timeout"),
     bannerTimeout: document.getElementById("banner-timeout"),
@@ -1303,6 +1312,43 @@
   }
 
   // ------------------------------------------------------------------
+  // Ước tính riêng cho từng giai đoạn
+  // ------------------------------------------------------------------
+
+  function stageLevel(attempts) {
+    if (attempts > HARD_ATTEMPTS) {
+      return "error";
+    }
+    if (attempts > WARN_ATTEMPTS) {
+      return "warn";
+    }
+    return "";
+  }
+
+  function stageSuffix(attempts, seconds) {
+    if (attempts > HARD_ATTEMPTS) {
+      return " · vượt trần cứng " + formatNumber(HARD_ATTEMPTS);
+    }
+    if (attempts > WARN_ATTEMPTS) {
+      return " · vượt mốc cảnh báo " + formatNumber(WARN_ATTEMPTS) +
+        " (cần xác nhận)";
+    }
+    return " · khoảng " + durationText(seconds);
+  }
+
+  function setStageLine(el, text, level) {
+    el.textContent = text;
+    el.className = "stage-line" + (level ? " stage-" + level : "");
+    el.hidden = false;
+  }
+
+  function hideStageEstimates() {
+    els.stageEstimates.hidden = true;
+    els.discoveryEstimate.hidden = true;
+    els.scanEstimate.hidden = true;
+  }
+
+  // ------------------------------------------------------------------
   // Sự kiện giao diện
   // ------------------------------------------------------------------
 
@@ -1310,6 +1356,7 @@
     var check = validateTarget(els.ip.value, els.prefix.value);
     if (!check.ok) {
       setPreview("");
+      hideStageEstimates();
       hideLargeScanBox();
       if (reportError) {
         showFieldError(check.message);
@@ -1323,35 +1370,71 @@
     if (advanced === null || portCount === null) {
       // Lỗi chi tiết đã hiện ở ô tương ứng; chỉ hiện phần mô tả mục tiêu.
       setPreview(describeTarget(check));
+      hideStageEstimates();
       hideLargeScanBox();
       return true;
     }
 
     var hostCount = targetHostCount(check);
-    var discoveryCount = check.prefix === null ? 0 : advanced.discoveryCount;
-    var attempts = estimateAttempts(hostCount, portCount, discoveryCount);
-    var seconds = estimateSeconds(
-      hostCount, portCount, advanced.timeout,
-      discoveryCount, advanced.discoveryTimeout, advanced.workers
+    var isCidr = check.prefix !== null;
+    var discoveryCount = isCidr ? advanced.discoveryCount : 0;
+
+    // Hai giai đoạn được ước tính RIÊNG, không hiển thị tổng của chúng.
+    var discoveryAttempts = isCidr
+      ? stageAttempts(hostCount, discoveryCount) : 0;
+    var scanAttempts = stageAttempts(hostCount, portCount);
+    var discoverySeconds = isCidr
+      ? stageSeconds(hostCount, discoveryCount, advanced.discoveryTimeout, advanced.workers)
+      : 0;
+    var scanSeconds = stageSeconds(
+      hostCount, portCount, advanced.timeout, advanced.workers
     );
 
-    setPreview(
-      describeTarget(check) + " · ≈ " + formatNumber(attempts) +
-      " lượt quét, khoảng " + durationText(seconds)
+    setPreview(describeTarget(check));
+    els.stageEstimates.hidden = false;
+
+    if (isCidr) {
+      setStageLine(
+        els.discoveryEstimate,
+        "Lượt dò (ước tính): " + formatNumber(discoveryAttempts) +
+        stageSuffix(discoveryAttempts, discoverySeconds),
+        stageLevel(discoveryAttempts)
+      );
+    } else {
+      els.discoveryEstimate.hidden = true;
+    }
+    setStageLine(
+      els.scanEstimate,
+      "Lượt quét cổng (ước tính theo số host tối đa): " +
+      formatNumber(scanAttempts) + stageSuffix(scanAttempts, scanSeconds),
+      stageLevel(scanAttempts)
     );
 
-    if (attempts > HARD_ATTEMPTS) {
+    var hardStages = [];
+    var warnStages = [];
+    if (isCidr && discoveryAttempts > HARD_ATTEMPTS) {
+      hardStages.push("giai đoạn dò host sống");
+    } else if (isCidr && discoveryAttempts > WARN_ATTEMPTS) {
+      warnStages.push("giai đoạn dò host sống");
+    }
+    if (scanAttempts > HARD_ATTEMPTS) {
+      hardStages.push("giai đoạn quét cổng");
+    } else if (scanAttempts > WARN_ATTEMPTS) {
+      warnStages.push("giai đoạn quét cổng");
+    }
+
+    if (hardStages.length > 0) {
       showLargeScanBox(
-        "Ước tính " + formatNumber(attempts) + " lượt, vượt trần cứng " +
-        formatNumber(HARD_ATTEMPTS) + " lượt nên server sẽ từ chối. " +
-        "Hãy giảm số cổng hoặc thu nhỏ dải CIDR.",
+        "Ước tính vượt trần cứng " + formatNumber(HARD_ATTEMPTS) +
+        " lượt ở " + hardStages.join(" và ") +
+        " nên server sẽ từ chối. Hãy giảm số cổng hoặc thu nhỏ dải CIDR.",
         false
       );
-    } else if (attempts > WARN_ATTEMPTS) {
+    } else if (warnStages.length > 0) {
       showLargeScanBox(
-        "Ước tính " + formatNumber(attempts) + " lượt, vượt mốc " +
-        formatNumber(WARN_ATTEMPTS) + " lượt (khoảng " + durationText(seconds) +
-        "). Quét dải lớn có thể làm chậm mạng và dễ bị hệ thống an ninh phát hiện.",
+        "Ước tính vượt mốc " + formatNumber(WARN_ATTEMPTS) +
+        " lượt ở " + warnStages.join(" và ") +
+        ". Quét dải lớn có thể làm chậm mạng và dễ bị hệ thống an ninh phát hiện.",
         true
       );
     } else {
@@ -1458,15 +1541,13 @@
       return;
     }
 
-    // Server yêu cầu xác nhận riêng khi vượt mốc cảnh báo.
+    // Server yêu cầu xác nhận riêng khi một giai đoạn vượt mốc cảnh báo.
     if (res.ok && data && data.confirmation_required) {
       setBusy(false);
       els.status.textContent = "Cần xác nhận quét lớn";
       renderEmptyRow(EMPTY_HINT);
       showLargeScanBox(
-        (data.message || "Lần quét này vượt mốc cảnh báo.") +
-        " (≈ " + formatNumber(data.estimated_attempts || 0) + " lượt, khoảng " +
-        (data.estimated_duration || "không rõ") + ")",
+        data.message || "Lần quét này vượt mốc cảnh báo.",
         true
       );
       return;
