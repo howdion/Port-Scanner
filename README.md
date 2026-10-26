@@ -19,10 +19,7 @@ cổng. Kết quả có thể xuất ra báo cáo JSON/CSV.
 ```powershell
 git clone https://github.com/howdion/Port-Scanner.git
 cd Port-Scanner
-py -3.12 -m venv .venv
 ```
-
-Không cần cài thêm thư viện ngoài.
 
 ## Cấu trúc thư mục
 
@@ -43,7 +40,7 @@ Port Scanner/
 │   └── test_web_server.py
 ├── web/
 │   └── index.html     # giao diện web: HTML + CSS + JS thuần, một file
-├── .venv/             # môi trường ảo (không commit)
+├── .venv/             # môi trường ảo (tự setup nếu muốn, không commit)
 ├── __pycache__/       # cache Python (không commit)
 └── reports/           # báo cáo sinh ra (không commit)
 ```
@@ -53,7 +50,7 @@ Port Scanner/
 Bộ kiểm thử dùng `unittest` của thư viện chuẩn, không cần cài thêm gói:
 
 ```powershell
-.venv\Scripts\python.exe -m unittest discover tests
+python -m unittest discover tests
 ```
 
 - `tests/test_parsing.py`: phân tích mục tiêu (IPv4/CIDR) và dải cổng, kiểm tra dải nội bộ.
@@ -70,30 +67,30 @@ của bài kiểm thử nằm trong `reports/` (đã bị `.gitignore` bỏ qua)
 
 ## Cách chạy
 
-Trên Windows (dùng virtual environment của dự án):
+Trên Windows:
 
 ```powershell
-.venv\Scripts\python.exe main.py 127.0.0.1 --ports 1-1024
+python main.py 127.0.0.1 --ports 1-1024
 ```
 
 Quét vài cổng cụ thể để xem tên dịch vụ và banner:
 
 ```powershell
-.venv\Scripts\python.exe main.py 127.0.0.1 --ports 135,445,5357
+python main.py 127.0.0.1 --ports 135,445,5357
 ```
 
 Quét một dải CIDR (tối đa /24):
 
 ```powershell
-.venv\Scripts\python.exe main.py 127.0.0.0/30 --ports 1-1024
+python main.py 127.0.0.0/30 --ports 1-1024
 ```
 
 Xuất báo cáo JSON/CSV (thư mục `reports/` được tạo tự động):
 
 ```powershell
-.venv\Scripts\python.exe main.py 127.0.0.1 --ports 1-1024 --output reports/single.json --format json
-.venv\Scripts\python.exe main.py 127.0.0.1 --ports 1-1024 --output reports/single.csv --format csv
-.venv\Scripts\python.exe main.py 127.0.0.0/30 --ports 1-1024 --output reports/cidr.json --format json
+python main.py 127.0.0.1 --ports 1-1024 --output reports/single.json --format json
+python main.py 127.0.0.1 --ports 1-1024 --output reports/single.csv --format csv
+python main.py 127.0.0.0/30 --ports 1-1024 --output reports/cidr.json --format json
 ```
 
 Nếu `--output` chỉ là tên file, báo cáo được ghi vào `reports/`.
@@ -102,13 +99,13 @@ Một số tùy chọn hữu ích:
 
 ```powershell
 # Ghi đè báo cáo đã tồn tại mà không hỏi
-.venv\Scripts\python.exe main.py 127.0.0.1 --ports 1-1024 --output reports/single.json --format json --force
+python main.py 127.0.0.1 --ports 1-1024 --output reports/single.json --format json --force
 
 # Tự xác nhận mục tiêu ngoài dải nội bộ (chỉ dùng khi có quyền quét)
-.venv\Scripts\python.exe main.py 203.0.113.10 --ports 53 --yes
+python main.py 203.0.113.10 --ports 53 --yes
 
 # Chỉ dò host sống qua cổng 135
-.venv\Scripts\python.exe main.py 127.0.0.0/30 --ports 135,445 --discovery-ports 135
+python main.py 127.0.0.0/30 --ports 135,445 --discovery-ports 135
 ```
 
 Khi chạy không tương tác (stdin không phải terminal), cần `--yes` để xác nhận mục
@@ -117,19 +114,19 @@ tiêu ngoài dải nội bộ và `--force` để ghi đè báo cáo.
 Quét một vài cổng cụ thể với timeout 1 giây:
 
 ```powershell
-.venv\Scripts\python.exe main.py 192.168.1.10 --ports 22,80,443 --timeout 1
+python main.py 192.168.1.10 --ports 22,80,443 --timeout 1
 ```
 
 Trên Linux/macOS:
 
 ```bash
-.venv/bin/python main.py 127.0.0.1 --ports 1-1024
+python main.py 127.0.0.1 --ports 1-1024
 ```
 
 Chạy không tham số sẽ quét `127.0.0.1` với các cổng `1-1024`:
 
 ```powershell
-.venv\Scripts\python.exe main.py
+python main.py
 ```
 
 Tăng `--timeout` nếu mạng chậm; tăng `--banner-timeout` nếu dịch vụ trả banner
@@ -296,13 +293,13 @@ một file HTML duy nhất (không CDN, không framework, không cần `pip inst
 Chạy:
 
 ```powershell
-.venv\Scripts\python.exe web_server.py
+python web_server.py
 ```
 
 Đổi cổng nếu 8000 đang bận:
 
 ```powershell
-.venv\Scripts\python.exe web_server.py --port 8080
+python web_server.py --port 8080
 ```
 
 Sau đó mở địa chỉ mà chương trình in ra, ví dụ
