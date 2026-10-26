@@ -101,6 +101,14 @@ class WebServerTestCase(unittest.TestCase):
         self.thread.start()
 
     def tearDown(self) -> None:
+        # Hủy job còn chạy và chờ nó dừng hẳn, để thread nền không tiếp tục
+        # quét (và không lọt sang bài kiểm thử kế tiếp).
+        job = self.manager.running_job()
+        if job is not None:
+            job.cancel_event.set()
+            deadline = time.time() + 15
+            while time.time() < deadline and job.status == "running":
+                time.sleep(0.05)
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=5)
@@ -175,6 +183,26 @@ class WebServerTestCase(unittest.TestCase):
         """Như fake_scan nhưng chậm, để có thời gian hủy giữa các lô."""
         time.sleep(0.02)
         return port in (135, 445)
+
+    @staticmethod
+    def discovery_alive_scan(host: str, port: int, timeout: float = 1.0) -> bool:
+        """Dò host: cổng 135 sống ngay; cổng khác chậm và chỉ 445 mở.
+
+        Nhờ vậy mọi host trong dải đều được coi là sống, và job vẫn chạy đủ lâu
+        để kịp hủy trong bài kiểm thử.
+        """
+        if port == 135:
+            return True
+        time.sleep(0.05)
+        return port == 445
+
+    def cancel_if_running(self, job_id: str) -> None:
+        """Hủy job nếu còn chạy; bỏ qua nếu job đã kết thúc."""
+        status, _, _ = self.request(
+            "POST", f"/api/scan/{job_id}/cancel", None, self.auth_headers
+        )
+        if status != 409:
+            self.assertEqual(status, 200)
 
     def start_scan(self, target: str, ports: str, **extra: object) -> str:
         """Bắt đầu một lần quét và trả về id của job."""
@@ -353,11 +381,21 @@ class TargetRestrictionTest(WebServerTestCase):
                 self.assertTrue(web_server.is_internal(parsed))
 
     def test_cidr_larger_than_slash_18_is_rejected(self) -> None:
-        for target in ("10.0.0.0/17", "192.168.0.0/16", "127.0.0.0/8"):
+        # Không quét dải thật: chỉ kiểm tra lớp từ chối của server.
+        for target in ("10.0.0.0/16", "10.0.0.0/17", "127.0.0.0/8", "0.0.0.0/0"):
             with self.subTest(target=target):
                 status, raw = self.post_scan(target, "80")
                 self.assertEqual(status, 400)
                 self.assertIn("/18", self.error_of(raw))
+
+    def test_cidr_slash_18_at_boundary_is_accepted(self) -> None:
+        # Dùng scan_port giả để không thật sự dò 16382 host.
+        with mock.patch.object(scanner, "scan_port", side_effect=self.slow_scan):
+            status, raw = self.post_scan("127.0.0.0/18", "135")
+            self.assertEqual(status, 202)
+            job_id = json.loads(raw)["id"]
+            self.request("POST", f"/api/scan/{job_id}/cancel", None, self.auth_headers)
+            self.wait_done(job_id)
 
     def test_cidr_slash_24_at_boundary_is_accepted(self) -> None:
         # Dùng scan_port giả để không thật sự dò 254 host.
@@ -436,7 +474,7 @@ class LimitsTest(WebServerTestCase):
     """Giới hạn số cổng và số luồng do server quyết định."""
 
     def test_too_many_attempts_is_rejected(self) -> None:
-        # 254 host của /24 × 65535 cổng vượt giới hạn tổng của một job.
+        # 254 host của /24 × 65535 cổng vượt trần cứng của một job.
         calls: list[tuple[str, int]] = []
 
         def spy(host: str, port: int, timeout: float = 1.0) -> bool:
@@ -447,8 +485,9 @@ class LimitsTest(WebServerTestCase):
             status, raw = self.post_scan("192.168.1.0/24", "1-65535")
             self.assertEqual(status, 400)
             message = self.error_of(raw)
-            self.assertIn("lượt thử", message)
-            self.assertIn(str(web_server.MAX_ATTEMPTS), message)
+            self.assertIn("Vượt trần cứng", message)
+            self.assertIn("5.000.000", message)
+            self.assertIn("giảm số cổng", message)
 
             time.sleep(0.3)
             self.assertEqual(calls, [], "không được mở kết nối nào khi bị từ chối")
@@ -456,6 +495,28 @@ class LimitsTest(WebServerTestCase):
             status2, raw2 = self.post_scan("127.0.0.1", "135")
             self.assertEqual(status2, 202)
             self.wait_done(json.loads(raw2)["id"])
+
+    def test_slash_18_with_full_range_is_rejected_without_connection(self) -> None:
+        calls: list[tuple[str, int]] = []
+
+        def spy(host: str, port: int, timeout: float = 1.0) -> bool:
+            calls.append((host, port))
+            return False
+
+        with mock.patch.object(scanner, "scan_port", side_effect=spy):
+            # Kể cả khi đã xác nhận, trần cứng vẫn từ chối và không mở kết nối.
+            status, raw = self.post_scan(
+                "10.0.0.0/18", "1-65535", confirm=True
+            )
+            self.assertEqual(status, 400)
+            self.assertIn("Vượt trần cứng", self.error_of(raw))
+            time.sleep(0.3)
+            self.assertEqual(calls, [], "không được mở kết nối nào")
+
+    def test_slash_17_is_rejected(self) -> None:
+        status, raw = self.post_scan("10.0.0.0/17", "80")
+        self.assertEqual(status, 400)
+        self.assertIn("/18", self.error_of(raw))
 
     def test_workers_above_limit_is_rejected(self) -> None:
         status, raw = self.post_scan("127.0.0.1", "80", workers=web_server.MAX_WORKERS + 1)
@@ -492,6 +553,145 @@ class LimitsTest(WebServerTestCase):
         status, raw = self.post_scan("127.0.0.1", "1-65536")
         self.assertEqual(status, 400)
         self.assertIn("65535", self.error_of(raw))
+
+
+class LargeScanConfirmationTest(WebServerTestCase):
+    """Hai mốc giới hạn: cảnh báo cần xác nhận, và trần cứng."""
+
+    def test_below_warning_runs_immediately(self) -> None:
+        # /25 × 1024 cổng = 126 × 1029 = 129.654 lượt, dưới mốc cảnh báo.
+        with mock.patch.object(scanner, "scan_port", side_effect=self.discovery_alive_scan), \
+                mock.patch.object(scanner, "grab_banner", return_value=None):
+            status, raw = self.post_scan("127.0.0.0/25", "1-1024")
+            self.assertEqual(status, 202)
+            snapshot = json.loads(raw)
+            self.assertNotIn("confirmation_required", snapshot)
+            self.assertIn("id", snapshot)
+            self.cancel_if_running(snapshot["id"])
+            self.wait_done(snapshot["id"], timeout=60)
+
+    def test_above_warning_requires_confirmation(self) -> None:
+        # /24 × 2048 cổng = 254 × 2053 = 521.462 lượt: vượt mốc, dưới trần cứng.
+        status, raw = self.post_scan("127.0.0.0/24", "1-2048")
+        self.assertEqual(status, 202)
+        payload = json.loads(raw)
+        self.assertTrue(payload["confirmation_required"])
+        self.assertNotIn("id", payload, "chưa được tạo job nào")
+        self.assertEqual(payload["warn_threshold"], web_server.WARN_ATTEMPTS)
+        self.assertEqual(payload["hard_threshold"], web_server.HARD_ATTEMPTS)
+        self.assertGreater(payload["estimated_attempts"], web_server.WARN_ATTEMPTS)
+        self.assertLessEqual(payload["estimated_attempts"], web_server.HARD_ATTEMPTS)
+        self.assertIn("mốc", payload["message"])
+
+        # Chưa có job nào chạy -> yêu cầu khác vẫn được nhận.
+        status2, raw2 = self.post_scan("127.0.0.1", "135")
+        self.assertEqual(status2, 202)
+        self.wait_done(json.loads(raw2)["id"])
+
+    def test_above_warning_runs_after_confirmation(self) -> None:
+        with mock.patch.object(scanner, "scan_port", side_effect=self.discovery_alive_scan), \
+                mock.patch.object(scanner, "grab_banner", return_value=None):
+            status, raw = self.post_scan("127.0.0.0/24", "1-2048", confirm=True)
+            self.assertEqual(status, 202)
+            snapshot = json.loads(raw)
+            self.assertIn("id", snapshot)
+            self.assertNotIn("confirmation_required", snapshot)
+            self.cancel_if_running(snapshot["id"])
+            self.wait_done(snapshot["id"], timeout=60)
+
+    def test_confirmation_flag_must_be_boolean(self) -> None:
+        status, raw = self.post_scan("127.0.0.1", "135", confirm="yes")
+        self.assertEqual(status, 400)
+        self.assertIn("confirm", self.error_of(raw))
+
+
+class AdvancedParamsTest(WebServerTestCase):
+    """Các tham số nâng cao, server luôn kiểm tra lại."""
+
+    def test_defaults_when_not_sent(self) -> None:
+        status, raw = self.post_scan("127.0.0.1", "135")
+        self.assertEqual(status, 202)
+        snapshot = json.loads(raw)
+        self.assertEqual(
+            snapshot["params"],
+            {
+                "timeout": web_server.DEFAULT_SCAN_TIMEOUT,
+                "banner_timeout": web_server.DEFAULT_BANNER_TIMEOUT,
+                "discovery_timeout": web_server.DEFAULT_DISCOVERY_TIMEOUT,
+                "discovery_ports": "22,80,135,443,445",
+                "workers": web_server.DEFAULT_WORKERS,
+            },
+        )
+        self.wait_done(snapshot["id"])
+
+    def test_custom_values_are_used(self) -> None:
+        with mock.patch.object(scanner, "scan_port", side_effect=self.slow_scan):
+            status, raw = self.post_scan(
+                "127.0.0.1",
+                "1-100",
+                timeout=0.25,
+                banner_timeout=0.2,
+                discovery_timeout=0.1,
+                discovery_ports="80,443",
+                workers=7,
+            )
+            self.assertEqual(status, 202)
+            snapshot = json.loads(raw)
+            self.assertEqual(snapshot["params"]["timeout"], 0.25)
+            self.assertEqual(snapshot["params"]["banner_timeout"], 0.2)
+            self.assertEqual(snapshot["params"]["discovery_timeout"], 0.1)
+            self.assertEqual(snapshot["params"]["discovery_ports"], "80,443")
+            self.assertEqual(snapshot["params"]["workers"], 7)
+            self.cancel(snapshot["id"])
+            self.wait_done(snapshot["id"])
+
+    def test_out_of_range_values_are_rejected(self) -> None:
+        cases = [
+            {"timeout": 0.001},
+            {"timeout": 99},
+            {"timeout": "1.0"},
+            {"timeout": True},
+            {"banner_timeout": 0},
+            {"banner_timeout": 20},
+            {"discovery_timeout": -1},
+            {"discovery_timeout": 100},
+            {"discovery_ports": "0-10"},
+            {"discovery_ports": "80,,443"},
+            {"discovery_ports": 80},
+            {"discovery_ports": "1-99999"},
+            {"workers": 0},
+            {"workers": 101},
+            {"workers": "10"},
+        ]
+        for extra in cases:
+            with self.subTest(extra=extra):
+                status, raw = self.post_scan("127.0.0.1", "135", **extra)
+                self.assertEqual(status, 400, raw)
+
+    def test_discovery_ports_count_is_capped(self) -> None:
+        too_many = ",".join(str(port) for port in range(1000, 1000 + web_server.MAX_DISCOVERY_PORTS + 1))
+        status, raw = self.post_scan("127.0.0.1", "135", discovery_ports=too_many)
+        self.assertEqual(status, 400)
+        self.assertIn("discovery_ports", self.error_of(raw))
+
+    def test_advanced_values_affect_the_attempt_estimate(self) -> None:
+        # Nhiều cổng dò host hơn => ước tính cao hơn.
+        base = 126 * (5 + 1024)
+        extra = 126 * (60 + 1024)
+        self.assertLess(base, extra)
+        self.assertLess(extra, web_server.WARN_ATTEMPTS)
+
+        discovery = ",".join(str(port) for port in range(1000, 1060))
+        with mock.patch.object(scanner, "scan_port", side_effect=self.discovery_alive_scan), \
+                mock.patch.object(scanner, "grab_banner", return_value=None):
+            status, raw = self.post_scan(
+                "127.0.0.0/25", "1-1024", discovery_ports=discovery
+            )
+            self.assertEqual(status, 202)
+            snapshot = json.loads(raw)
+            self.assertNotIn("confirmation_required", snapshot)
+            self.cancel_if_running(snapshot["id"])
+            self.wait_done(snapshot["id"], timeout=60)
 
 
 class SingleScanAtATimeTest(WebServerTestCase):
@@ -786,7 +986,7 @@ class BatchScanTest(WebServerTestCase):
         with mock.patch.object(scanner, "scan_port", side_effect=spy):
             status, raw = self.post_scan("10.0.0.0/24", "1-65535")
             self.assertEqual(status, 400)
-            self.assertIn("lượt thử", self.error_of(raw))
+            self.assertIn("Vượt trần cứng", self.error_of(raw))
             time.sleep(0.3)
             self.assertEqual(calls, [], "không được mở kết nối nào")
 
