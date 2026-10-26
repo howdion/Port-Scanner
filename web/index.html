@@ -754,39 +754,57 @@
   // Tiến độ
   // ------------------------------------------------------------------
 
-  function currentHostTotal(job) {
-    // Trong giai đoạn quét cổng, tổng số host nằm ở đầu thông báo dạng "[1/2]".
-    var match = /^\[(\d+)\/(\d+)\]/.exec(job.message || "");
-    return match ? Number(match[2]) : null;
+  function batchText(job) {
+    var batch = job.batch;
+    if (!batch || !batch.total) {
+      return "";
+    }
+    var text = "Lô " + batch.index + "/" + batch.total;
+    if (batch.port_range) {
+      text += " (cổng " + batch.port_range + ")";
+    }
+    return text;
+  }
+
+  function jobPortsText(job) {
+    var batch = job.batch;
+    if (!batch || !batch.ports_total) {
+      return "";
+    }
+    return "Đã quét " + (batch.ports_done || 0) + "/" + batch.ports_total + " cổng";
   }
 
   function phaseCountText(job) {
     var progress = job.progress || {};
-    var done = progress.done || 0;
-    var total = progress.total || 0;
     if (job.phase === "discovery") {
-      return "Đã dò " + done + "/" + total + " host";
+      return "Đã dò " + (progress.done || 0) + "/" + (progress.total || 0) + " host";
     }
-    if (job.phase === "scanning") {
-      // Chỉ ghi "của host hiện tại" khi lần quét thật sự có nhiều host.
-      var hostTotal = currentHostTotal(job);
-      var suffix = hostTotal !== null && hostTotal > 1 ? " của host hiện tại" : "";
-      return "Đã quét " + done + "/" + total + " cổng" + suffix;
+    // Đi theo tổng số cổng của cả job, không phải của riêng lô hiện tại.
+    var text = jobPortsText(job);
+    if (!text) {
+      text = "Đã quét " + (progress.done || 0) + "/" + (progress.total || 0) + " cổng";
     }
-    return total > 0 ? done + "/" + total : "";
+    return text;
   }
 
   function hostCounterText(job) {
-    // Trong giai đoạn quét cổng, chỉ số host nằm ở đầu thông báo dạng "[1/2]".
+    // Chỉ hiện khi lần quét thật sự có nhiều hơn một host.
     var match = /^\[(\d+)\/(\d+)\]/.exec(job.message || "");
-    if (match) {
-      return "Host " + match[1] + "/" + match[2];
+    if (!match || Number(match[2]) <= 1) {
+      return "";
     }
-    if (job.phase === "discovery") {
-      var progress = job.progress || {};
-      return "Host " + (progress.done || 0) + "/" + (progress.total || 0);
+    return "Host " + match[1] + "/" + match[2];
+  }
+
+  function progressRatio(job) {
+    // Thanh tiến độ chạy theo tổng số cổng của cả job; nếu server cũ chưa trả
+    // trường 'batch' thì lùi về tiến độ trong lô hiện tại.
+    var batch = job.batch;
+    if (batch && batch.ports_total) {
+      return { done: batch.ports_done || 0, total: batch.ports_total };
     }
-    return "";
+    var progress = job.progress || {};
+    return { done: progress.done || 0, total: progress.total || 0 };
   }
 
   function detailMessage(job) {
@@ -822,8 +840,8 @@
   }
 
   function renderJob(job) {
-    var progress = job.progress || { done: 0, total: 0 };
-    setProgress(progress.done || 0, progress.total || 0);
+    var ratio = progressRatio(job);
+    setProgress(ratio.done, ratio.total);
 
     var statusLabel = STATUS_TEXT[job.status] || job.status;
     var phaseLabel = PHASE_TEXT[job.phase];
@@ -831,7 +849,7 @@
       ? statusLabel + " — " + phaseLabel
       : statusLabel;
 
-    var parts = [hostCounterText(job), phaseCountText(job)];
+    var parts = [batchText(job), hostCounterText(job), phaseCountText(job)];
     var phaseLine = [];
     for (var i = 0; i < parts.length; i++) {
       if (parts[i]) {
@@ -849,7 +867,8 @@
 
     renderResults(job.results || [], job);
     els.count.textContent = "(" + (job.total_open_ports || 0) + " cổng mở)";
-    els.partial.hidden = !(job.status === "cancelled" || job.status === "error");
+    // Kết quả còn thiếu khi job chưa xong (còn lô chưa chạy), bị hủy hoặc lỗi.
+    els.partial.hidden = job.status === "done";
 
     var ready = job.status !== "running";
     els.dlJson.disabled = !ready;

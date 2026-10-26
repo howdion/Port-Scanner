@@ -44,7 +44,12 @@ DEFAULT_PORT = 8000
 TOKEN_HEADER = "X-Scan-Token"
 
 # Giới hạn phía server, không tin giá trị do trình duyệt gửi lên.
-MAX_PORTS = 2048
+MAX_PORTS = 65535
+# Kích thước một lô cổng: danh sách cổng được chia thành các lô liên tiếp cỡ này.
+BATCH_SIZE = 2048
+# Giới hạn tổng cho cả job: số host sống × số cổng không được vượt giá trị này
+# (262144 = 256 host × 1024 cổng), vì dải lớn nhân nhiều máy sẽ rất nặng.
+MAX_ATTEMPTS = 262144
 MAX_WORKERS = 100
 DEFAULT_WORKERS = 100
 MAX_BODY_BYTES = 65536
@@ -81,6 +86,50 @@ class ApiError(Exception):
         self.message = message
 
 
+def chunk_ports(ports: list[int]) -> list[list[int]]:
+    """Chia danh sách cổng thành các lô liên tiếp, mỗi lô tối đa BATCH_SIZE cổng.
+
+    Danh sách được sắp xếp và loại trùng trước khi chia, nên các lô luôn liên
+    tiếp nhau và không chồng lấn.
+    """
+    ordered = sorted(set(ports))
+    return [
+        ordered[index:index + BATCH_SIZE]
+        for index in range(0, len(ordered), BATCH_SIZE)
+    ]
+
+
+def count_target_hosts(
+    target: ipaddress.IPv4Address | ipaddress.IPv4Network,
+) -> int:
+    """Số host tối đa của mục tiêu, dùng để kiểm tra giới hạn trước khi quét."""
+    if isinstance(target, ipaddress.IPv4Network):
+        return sum(1 for _ in target.hosts())
+    return 1
+
+
+def attempt_limit_message(hosts: int, ports: int) -> str:
+    """Thông báo khi vượt giới hạn tổng số lượt thử của một job."""
+    return (
+        f"Vượt giới hạn tổng của một lần quét: tối đa {MAX_ATTEMPTS} lượt thử "
+        f"(host × cổng), nhưng yêu cầu là {hosts} host × {ports} cổng = "
+        f"{hosts * ports} lượt. Hãy giảm số cổng hoặc thu nhỏ dải CIDR."
+    )
+
+
+def sort_records(records: list[ScanRecord]) -> list[ScanRecord]:
+    """Sắp xếp kết quả theo địa chỉ IP (so sánh số) rồi theo cổng."""
+
+    def key(record: ScanRecord) -> tuple[int, int]:
+        try:
+            return (int(ipaddress.IPv4Address(record.host)), record.port)
+        except ValueError:
+            # Không phải IPv4 (không xảy ra với dữ liệu hiện tại): xếp cuối.
+            return (1 << 32, record.port)
+
+    return sorted(records, key=key)
+
+
 class ScanJob:
     """Trạng thái và kết quả của một lần quét chạy ở thread nền."""
 
@@ -92,6 +141,8 @@ class ScanJob:
         self.id = uuid.uuid4().hex
         self.target = target
         self.ports = list(ports)
+        # Chia lô ngay khi tạo job để snapshot đầu tiên đã có đủ thông tin lô.
+        self.batches = chunk_ports(self.ports)
         self.status = "running"
         self.phase = "starting"
         self.done = 0
@@ -99,11 +150,20 @@ class ScanJob:
         self.message = "Đang khởi động..."
         self.records: list[ScanRecord] = []
         self.errors: list[str] = []
-        self.metadata: dict[str, object] = {}
         self.started_at = current_timestamp()
         self.finished_at: str | None = None
         self.cancel_event = threading.Event()
         self._lock = threading.Lock()
+        # Tiến độ theo lô: batch_index là lô đang chạy (1-based), ports_done là
+        # số cổng đã quét xong trên tổng số cổng của cả job.
+        self.batch_index = 0
+        self.batch_total = len(self.batches)
+        self.batch_port_range = ""
+        self.ports_total = len(self.ports)
+        self.ports_done = 0
+        self.batches_completed = 0
+        self._started_monotonic = time.perf_counter()
+        self._duration: float | None = None
 
     def update(self, **fields: object) -> None:
         """Cập nhật thuộc tính trạng thái một cách an toàn giữa các luồng."""
@@ -129,56 +189,92 @@ class ScanJob:
         with self._lock:
             return list(self.records)
 
+    def records_for_report(self) -> list[ScanRecord]:
+        """Kết quả đã sắp xếp, dùng cho cả snapshot API lẫn file tải về."""
+        return sort_records(self.records_snapshot())
+
     def is_cancelled(self) -> bool:
         return self.cancel_event.is_set()
+
+    def mark_finished(self, status: str, message: str) -> None:
+        """Chốt trạng thái cuối của lần quét."""
+        with self._lock:
+            self.status = status
+            self.message = message
+            self.finished_at = current_timestamp()
+            self._duration = time.perf_counter() - self._started_monotonic
+
+    def report_metadata(self) -> dict:
+        """Metadata của báo cáo, tính tại thời điểm gọi.
+
+        Nhờ vậy vẫn tải được báo cáo khi job đang chạy hoặc đã bị hủy, và số lô
+        đã hoàn thành luôn đúng với thời điểm tải.
+        """
+        with self._lock:
+            duration = self._duration
+            if duration is None:
+                duration = time.perf_counter() - self._started_monotonic
+            return {
+                "target": str(self.target),
+                "port_range": format_port_spec(self.ports),
+                "total_open_ports": len(self.records),
+                "scan_duration_seconds": round(duration, 3),
+                "batches_completed": self.batches_completed,
+                "batches_total": self.batch_total,
+            }
 
     def snapshot(self) -> dict:
         """Bản chụp trạng thái để trả về qua API JSON."""
         with self._lock:
-            return {
+            payload = {
                 "id": self.id,
                 "target": str(self.target),
                 "ports": format_port_spec(self.ports),
                 "status": self.status,
                 "phase": self.phase,
                 "message": self.message,
+                # Giữ nguyên 'progress' cũ (tiến độ trong lô hiện tại) để không
+                # làm hỏng giao diện đang dùng.
                 "progress": {"done": self.done, "total": self.total},
+                "batch": {
+                    "index": self.batch_index,
+                    "total": self.batch_total,
+                    "completed": self.batches_completed,
+                    "port_range": self.batch_port_range,
+                    "ports_done": self.ports_done,
+                    "ports_total": self.ports_total,
+                },
                 "started_at": self.started_at,
                 "finished_at": self.finished_at,
                 "total_open_ports": len(self.records),
-                "results": [asdict(record) for record in self.records],
+                "results": list(self.records),
                 "errors": list(self.errors),
                 "downloads": {
                     "json": f"/api/scan/{self.id}/download?format=json",
                     "csv": f"/api/scan/{self.id}/download?format=csv",
                 },
             }
+        # Sắp xếp ngoài lock để không giữ lock lâu khi có nhiều kết quả.
+        payload["results"] = [
+            asdict(record) for record in sort_records(payload["results"])
+        ]
+        return payload
 
 
-def finish_job(job: ScanJob, status: str, message: str, started: float) -> None:
-    """Chốt trạng thái cuối và metadata của lần quét."""
-    records = job.records_snapshot()
-    job.update(
-        status=status,
-        message=message,
-        finished_at=current_timestamp(),
-        metadata={
-            "target": str(job.target),
-            "port_range": format_port_spec(job.ports),
-            "total_open_ports": len(records),
-            "scan_duration_seconds": round(time.perf_counter() - started, 3),
-        },
-    )
+def finish_job(job: ScanJob, status: str, message: str) -> None:
+    """Chốt trạng thái cuối của lần quét."""
+    job.mark_finished(status, message)
 
 
 def run_scan(job: ScanJob, workers: int) -> None:
-    """Chạy quét trong thread nền, cập nhật tiến độ và kết quả vào job.
+    """Chạy quét trong thread nền, chia cổng thành từng lô.
 
-    Tái sử dụng nguyên logic trong scanner.py: dò host sống cho CIDR rồi quét
-    cổng và đọc banner cho từng host.
+    Tái sử dụng logic trong scanner.py: dò host sống cho CIDR đúng MỘT lần ở
+    đầu, rồi với mỗi lô cổng thì quét lô đó trên tất cả host sống. Kết quả được
+    gộp vào job ngay sau mỗi lô, nên API polling trả về được kết quả từng phần.
     """
-    started = time.perf_counter()
     errors: list[str] = []
+    batches = job.batches
 
     try:
         targets = [str(job.target)]
@@ -206,79 +302,117 @@ def run_scan(job: ScanJob, workers: int) -> None:
             )
 
             if job.is_cancelled():
-                finish_job(job, "cancelled", "Đã hủy quét.", started)
+                finish_job(job, "cancelled", "Đã hủy quét.")
                 return
             if not targets:
                 finish_job(
                     job,
                     "done",
                     "Không tìm thấy host nào phản hồi nên bỏ qua quét cổng.",
-                    started,
                 )
                 return
 
-        total_ports = len(job.ports)
-        for index, host in enumerate(targets, start=1):
-            if job.is_cancelled():
-                finish_job(job, "cancelled", "Đã hủy quét.", started)
+            # Kiểm tra lại giới hạn tổng bằng số host thực tế sau khi dò.
+            attempts = len(targets) * len(job.ports)
+            if attempts > MAX_ATTEMPTS:
+                finish_job(
+                    job,
+                    "error",
+                    attempt_limit_message(len(targets), len(job.ports)),
+                )
                 return
 
-            job.progress(
-                f"[{index}/{len(targets)}] Đang quét {host} ({total_ports} cổng)...",
-                0,
-                total_ports,
-                "scanning",
+        host_count = len(targets)
+        completed_ports = 0
+
+        for batch_index, batch_ports in enumerate(batches, start=1):
+            if job.is_cancelled():
+                finish_job(job, "cancelled", "Đã hủy quét.")
+                return
+
+            batch_size = len(batch_ports)
+            job.update(
+                batch_index=batch_index,
+                batch_port_range=format_port_spec(batch_ports),
+                phase="scanning",
             )
 
-            def on_port(
-                done: int,
-                total: int,
-                _host: str = host,
-                _index: int = index,
-                _count: int = len(targets),
-            ) -> None:
+            for host_index, host in enumerate(targets, start=1):
+                if job.is_cancelled():
+                    finish_job(job, "cancelled", "Đã hủy quét.")
+                    return
+
                 job.progress(
-                    f"[{_index}/{_count}] {_host}: {done}/{total} cổng",
-                    done,
-                    total,
+                    f"[{host_index}/{host_count}] Đang quét {host} "
+                    f"(lô {batch_index}/{len(batches)}, {batch_size} cổng)...",
+                    0,
+                    batch_size,
                     "scanning",
                 )
 
-            open_ports, port_errors = scan_ports(
-                host,
-                job.ports,
-                timeout=SCAN_TIMEOUT,
-                workers=workers,
-                on_progress=on_port,
-                should_cancel=job.is_cancelled,
-            )
-            errors.extend(f"{host}:{port} {message}" for port, message in port_errors)
+                def on_port(
+                    done: int,
+                    total: int,
+                    _host: str = host,
+                    _host_index: int = host_index,
+                ) -> None:
+                    # Tiến độ trong lô hiện tại, quy đổi dần ra tiến độ cả job.
+                    fraction = (
+                        (_host_index - 1) + (done / total if total else 1.0)
+                    ) / host_count
+                    job.update(
+                        message=(
+                            f"[{_host_index}/{host_count}] {_host}: "
+                            f"{done}/{total} cổng"
+                        ),
+                        done=done,
+                        total=total,
+                        phase="scanning",
+                        ports_done=int(completed_ports + batch_size * fraction),
+                    )
 
-            # Banner chỉ đọc cho cổng đã mở nên rất nhanh, kể cả khi vừa bị hủy.
-            banners = grab_banners(
-                host,
-                open_ports,
-                timeout=BANNER_TIMEOUT,
-                workers=workers,
-            )
-            job.add_records(
-                build_records(host, open_ports, banners, current_timestamp())
-            )
-            job.update(errors=list(errors))
+                open_ports, port_errors = scan_ports(
+                    host,
+                    batch_ports,
+                    timeout=SCAN_TIMEOUT,
+                    workers=workers,
+                    on_progress=on_port,
+                    should_cancel=job.is_cancelled,
+                )
+                errors.extend(
+                    f"{host}:{port} {message}" for port, message in port_errors
+                )
 
-            if job.is_cancelled():
-                finish_job(job, "cancelled", "Đã hủy quét.", started)
-                return
+                # Banner chỉ đọc cho cổng đã mở nên rất nhanh, kể cả khi vừa hủy.
+                banners = grab_banners(
+                    host,
+                    open_ports,
+                    timeout=BANNER_TIMEOUT,
+                    workers=workers,
+                )
+                job.add_records(
+                    build_records(host, open_ports, banners, current_timestamp())
+                )
+                job.update(errors=list(errors))
+
+                if job.is_cancelled():
+                    finish_job(job, "cancelled", "Đã hủy quét.")
+                    return
+
+            completed_ports += batch_size
+            job.update(
+                ports_done=completed_ports,
+                batches_completed=batch_index,
+            )
 
         finish_job(
             job,
             "done",
             f"Hoàn tất: {len(job.records_snapshot())} cổng mở.",
-            started,
         )
     except Exception as exc:  # noqa: BLE001 - không để lộ traceback ra trình duyệt
         job.update(errors=list(errors))
-        finish_job(job, "error", f"Lỗi khi quét: {exc}", started)
+        finish_job(job, "error", f"Lỗi khi quét: {exc}")
 
 
 class ScanManager:
@@ -489,19 +623,18 @@ class ScanRequestHandler(BaseHTTPRequestHandler):
         # Kết quả chứa IP nội bộ nên vẫn yêu cầu token dù đây là GET.
         if not self._token_ok():
             raise ApiError(403, "Thiếu hoặc sai token.")
-        if job.status == "running":
-            raise ApiError(409, "Lần quét chưa hoàn tất nên chưa tải được.")
 
         report_format = (parse_qs(query).get("format") or ["json"])[0].lower()
         if report_format not in ("json", "csv"):
             raise ApiError(400, "Định dạng không hợp lệ; chỉ nhận json hoặc csv.")
 
         try:
-            # Dùng lại đúng hàm định dạng mà CLI dùng để ghi báo cáo.
+            # Dùng lại đúng hàm định dạng mà CLI dùng để ghi báo cáo. Tải được
+            # cả khi job đang chạy hoặc đã bị hủy: chỉ trả những kết quả đã có.
             text = render_report(
                 report_format,
-                job.records_snapshot(),
-                job.metadata,
+                job.records_for_report(),
+                job.report_metadata(),
             )
         except ValueError as exc:
             raise ApiError(400, str(exc)) from exc
@@ -577,6 +710,13 @@ class ScanRequestHandler(BaseHTTPRequestHandler):
                 400,
                 f"Số cổng tối đa là {MAX_PORTS} (yêu cầu {len(ports)}).",
             )
+
+        # Giới hạn tổng: kiểm tra sớm bằng số host tối đa của dải, trước khi
+        # mở bất kỳ kết nối nào.
+        max_hosts = count_target_hosts(target)
+        attempts = max_hosts * len(ports)
+        if attempts > MAX_ATTEMPTS:
+            raise ApiError(400, attempt_limit_message(max_hosts, len(ports)))
 
         workers = data.get("workers", DEFAULT_WORKERS)
         if isinstance(workers, bool) or not isinstance(workers, int):
@@ -684,7 +824,11 @@ def main() -> int:
     url = f"http://{BIND_HOST}:{server.server_port}/"
     print(f"Web UI: {url}")
     print(f"Chỉ lắng nghe trên {BIND_HOST}:{server.server_port} (không vào được từ mạng LAN).")
-    print(f"Giới hạn: tối đa {MAX_PORTS} cổng mỗi lần quét, chỉ mục tiêu trong dải nội bộ.")
+    print(
+        f"Giới hạn: tối đa {MAX_PORTS} cổng mỗi lần quét, chia thành các lô "
+        f"{BATCH_SIZE} cổng, tổng tối đa {MAX_ATTEMPTS} lượt thử (host × cổng), "
+        f"chỉ mục tiêu trong dải nội bộ."
+    )
     print("Nhấn Ctrl+C để dừng.")
 
     try:
