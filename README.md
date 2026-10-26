@@ -353,9 +353,10 @@ host,port,protocol,service,banner,scanned_at
 127.0.0.1,445,tcp,microsoft-ds,,2026-10-25T23:54:49+07:00
 ```
 
-Với CIDR, tất cả host nằm trong cùng một mảng `results`; `metadata.target` là dải
-CIDR. Thư mục `reports/` nằm trong `.gitignore` để kết quả quét (có thể chứa IP
-nội bộ) không bị đưa lên GitHub.
+Khi quét nhiều host (qua `--hosts` hoặc `--hosts-file`), tất cả host nằm trong cùng
+một mảng `results`; `metadata.target` là nhãn `"N host"` và có thêm `hosts_count`.
+Thư mục `reports/` nằm trong `.gitignore` để kết quả quét (có thể chứa IP nội bộ)
+không bị đưa lên GitHub.
 
 ## Giao diện web
 
@@ -376,6 +377,11 @@ python web_server.py --port 8080
 
 Sau đó mở địa chỉ mà chương trình in ra, ví dụ
 [http://127.0.0.1:8000/](http://127.0.0.1:8000/).
+
+> **Đang chuyển sang luồng hai bước.** Server đã tách hai loại job `discover` và
+> `scan` (xem mục [API](#api) bên dưới). Trang HTML trong bản này vẫn dùng luồng
+> một-bước cũ nên tạm thời chỉ dùng được qua API; giao diện sẽ được cập nhật ở
+> bước tiếp theo.
 
 Giao diện gồm:
 
@@ -401,7 +407,7 @@ Giao diện gồm:
   | Timeout đọc banner (giây) | `banner_timeout` | `0.5` | `0.05`–`10` |
   | Timeout dò host (giây) | `discovery_timeout` | `0.3` | `0.05`–`10` |
   | Cổng dò host sống | `discovery_ports` | `22,80,135,443,445` | dải cổng hợp lệ, tối đa 64 cổng |
-  | Số luồng song song | `workers` | `100` | `1`–`100` |
+  | Số luồng song song | `concurrency` | `100` | `1`–`100` |
 
   Để trống một trường nghĩa là dùng mặc định. Giao diện kiểm tra định dạng và khoảng
   để hỗ trợ nhập liệu, nhưng **server luôn kiểm tra lại** và là nơi quyết định.
@@ -439,8 +445,8 @@ lần lượt từng lô:
 
 - Ví dụ nhập `1-4096` sẽ chạy lô 1 (`1-2048`), hiện kết quả, rồi mới chạy lô 2
   (`2049-4096`).
-- Với CIDR, bước **dò host sống chỉ chạy một lần** ở đầu; mỗi lô sau đó quét tất
-  cả host sống.
+- Job `scan` chỉ quét cổng trên danh sách host client gửi lên; bước dò host sống
+  là **job `discover` riêng**, không tự chạy kèm.
 - Sau mỗi lô, kết quả được gộp ngay vào job nên API polling trả về được **kết quả
   từng phần**. Kết quả luôn sắp xếp theo IP (so sánh số) rồi theo cổng.
 - Hủy quét có hiệu lực cả giữa các lô lẫn trong lô đang chạy: job chuyển
@@ -451,20 +457,74 @@ Hằng số kích thước lô nằm ở một chỗ duy nhất trong `web_serve
 
 ### API
 
+Hai loại job, hai nhóm endpoint. Mỗi job có `id` riêng và vòng đời riêng; không
+job nào tự chuyển từ giai đoạn này sang giai đoạn kia.
+
 | Phương thức | Đường dẫn | Mô tả |
 | --- | --- | --- |
 | `GET` | `/` | Trang giao diện, kèm token của phiên. |
-| `POST` | `/api/scan` | Bắt đầu quét. Body JSON: `{"target": "...", "ports": "...", ...}`. Trả `202` kèm `id`, hoặc `202` kèm `confirmation_required: true`, danh sách `stages` vượt mốc và `estimates` của từng giai đoạn khi có giai đoạn vượt mốc cảnh báo. Trường `target` là `"ip"` hoặc `"ip/prefix"`. |
+| `POST` | `/api/discover` | Dò host sống trong một CIDR. Body: `{"cidr": "…", "discovery_ports"?, "discovery_timeout"?, "concurrency"?, "confirm"?}`. Trả `202` kèm `id`, hoặc `202` kèm `confirmation_required: true` khi vượt mốc cảnh báo. |
+| `GET` | `/api/discover/<id>` | Trạng thái, tiến độ và `live_hosts` khi xong. |
+| `POST` | `/api/discover/<id>/cancel` | Yêu cầu hủy lần dò đang chạy. |
+| `POST` | `/api/scan` | Quét cổng trên danh sách host. Body: `{"hosts": ["127.0.0.1"], "ports": "1-1024", "timeout"?, "banner_timeout"?, "concurrency"?, "confirm"?}`. Trả `202` kèm `id`, hoặc `202` kèm `confirmation_required: true`. |
 | `GET` | `/api/scan/<id>` | Trạng thái, tiến độ và kết quả của một lần quét. |
 | `POST` | `/api/scan/<id>/cancel` | Yêu cầu hủy lần quét đang chạy. |
 | `GET` | `/api/scan/<id>/download?format=json\|csv` | Tải báo cáo, dùng lại `report.py`. Tải được cả khi job đang chạy hoặc đã bị hủy: chỉ trả những kết quả đã có. |
 
-`GET /api/scan/<id>` trả về (giữ nguyên các trường cũ):
+`hosts` là danh sách IPv4 tường minh, **không nhận CIDR**. Muốn quét theo dải thì
+gọi `/api/discover` trước rồi dùng `live_hosts` trả về. Quét một IP chỉ cần
+`"hosts": ["127.0.0.1"]`, không phải qua `discover`.
+
+Một lượt hai bước, gọi bằng `curl` (thay `TOKEN` bằng token trong trang):
+
+```powershell
+# Bước 1: dò host sống
+curl.exe -s -X POST http://127.0.0.1:8000/api/discover `
+  -H "X-Scan-Token: TOKEN" -H "Content-Type: application/json" `
+  -d '{\"cidr\":\"192.168.1.0/24\",\"discovery_ports\":\"22,80,135,443,445\"}'
+
+# Chờ tới khi status = done, rồi lấy danh sách trong trường live_hosts:
+curl.exe -s http://127.0.0.1:8000/api/discover/<id>
+
+# Bước 2: quét cổng trên những host bạn chọn
+curl.exe -s -X POST http://127.0.0.1:8000/api/scan `
+  -H "X-Scan-Token: TOKEN" -H "Content-Type: application/json" `
+  -d '{\"hosts\":[\"192.168.1.5\",\"192.168.1.9\"],\"ports\":\"22,80,443\"}'
+```
+
+`GET /api/discover/<id>` trả về:
 
 ```json
 {
   "id": "…",
+  "kind": "discover",
+  "cidr": "192.168.1.0/24",
+  "status": "done",
+  "phase": "discovery",
+  "message": "Hoàn tất: 12/254 host sống.",
+  "hosts_total": 254,
+  "live_hosts": ["192.168.1.5", "192.168.1.9"],
+  "total_live_hosts": 2,
+  "progress": { "done": 254, "total": 254 },
+  "params": {
+    "discovery_ports": "22,80,135,443,445",
+    "discovery_timeout": 0.3,
+    "concurrency": 100
+  },
+  "started_at": "2026-10-26T12:00:00+07:00",
+  "finished_at": "2026-10-26T12:00:04+07:00"
+}
+```
+
+`GET /api/scan/<id>` trả về:
+
+```json
+{
+  "id": "…",
+  "kind": "scan",
   "target": "127.0.0.1",
+  "hosts": ["127.0.0.1"],
+  "host_count": 1,
   "ports": "1-4096",
   "status": "running",
   "phase": "scanning",
@@ -478,6 +538,7 @@ Hằng số kích thước lô nằm ở một chỗ duy nhất trong `web_serve
     "ports_done": 512,
     "ports_total": 4096
   },
+  "params": { "timeout": 1.0, "banner_timeout": 0.5, "concurrency": 100 },
   "started_at": "2026-10-26T12:00:00+07:00",
   "finished_at": null,
   "total_open_ports": 0,
@@ -490,28 +551,37 @@ Hằng số kích thước lô nằm ở một chỗ duy nhất trong `web_serve
 - `progress` là tiến độ **trong lô hiện tại**; `batch.ports_done / batch.ports_total`
   là tiến độ **của cả job** (giao diện dùng số này cho thanh tiến độ).
 - `batch.completed` là số lô đã chạy xong.
+- `target` là nhãn hiển thị: một IP khi `hosts` có đúng một phần tử, ngược lại
+  `"N host"`.
 
-Metadata trong file tải về gồm `target`, `port_range`, `total_open_ports`,
-`scan_duration_seconds`, `batches_completed` và `batches_total`.
+Metadata trong file tải về gồm `target`, `hosts_count`, `port_range`,
+`total_open_ports`, `scan_duration_seconds`, `batches_completed` và `batches_total`.
+
+**Chạy đồng thời.** Mỗi loại job chỉ cho một job chạy tại một thời điểm: gọi
+`/api/scan` khi đang có job scan sẽ nhận `409`, tương tự với `/api/discover`.
+Hai loại **độc lập** nên một job discover và một job scan có thể chạy cùng lúc.
 
 Mã lỗi: `400` dữ liệu sai / vượt giới hạn, `403` thiếu token / Host hoặc Origin lạ /
-mục tiêu ngoài dải nội bộ, `404` id không tồn tại, `409` đang có lần quét khác chạy,
-`413` body quá lớn. Lỗi luôn trả JSON `{"error": "..."}`, không lộ traceback.
+CIDR hoặc host ngoài dải nội bộ, `404` id không tồn tại hoặc sai loại job, `409`
+đang có job cùng loại chạy, `413` body quá lớn. Lỗi luôn trả JSON `{"error": "..."}`,
+không lộ traceback.
 
 ### Ràng buộc an toàn của web server
 
 - **Chỉ bind `127.0.0.1`.** Không có tham số nào đổi được địa chỉ bind, nên máy
   khác trong LAN không truy cập được và không dùng được máy bạn để quét.
 - Kiểm tra **phía server**, không tin giao diện:
-  - mục tiêu phải thuộc dải nội bộ (`10.0.0.0/8`, `172.16.0.0/12`,
-    `192.168.0.0/16`, `127.0.0.0/8`), ngoài dải thì từ chối hẳn — trên web
+  - CIDR của `/api/discover` phải thuộc dải nội bộ (`10.0.0.0/8`,
+    `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`), ngoài dải thì từ chối hẳn;
+  - **từng host** trong `hosts` của `/api/scan` cũng bị kiểm tra như vậy — trên web
     **không có** cơ chế xác nhận để quét mục tiêu ngoài;
   - CIDR lớn hơn `/18` bị từ chối;
   - tối đa `65535` cổng mỗi job, chia thành các lô `2048` cổng;
-  - hai mốc giới hạn áp dụng riêng cho từng giai đoạn (xem mục "Hai mốc giới hạn
+  - hai mốc giới hạn áp dụng riêng cho từng loại job (xem mục "Hai mốc giới hạn
     cho từng giai đoạn" bên dưới);
   - tối đa `100` luồng; các timeout do server kiểm tra lại theo khoảng cho phép
-    (`0.05`–`10` giây) dù giao diện gửi lên giá trị nào.
+    (`0.05`–`10` giây) dù giao diện gửi lên giá trị nào;
+  - mỗi loại job chỉ một cái chạy tại một thời điểm.
 - Chống bị trang web khác lợi dụng: kiểm tra header `Host` (chỉ nhận
   `127.0.0.1:<cổng>` hoặc `localhost:<cổng>`), kiểm tra `Origin` với mọi request
   `POST`, và bắt buộc gửi token ngẫu nhiên sinh bằng `secrets` mỗi lần khởi động
