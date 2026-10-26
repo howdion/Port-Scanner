@@ -1,16 +1,16 @@
 # Port Scanner
 
 Công cụ quét cổng TCP dùng để học về mạng máy tính, đặc biệt là TCP handshake
-và lập trình socket. Chương trình nhận một địa chỉ IPv4 hoặc một dải CIDR, kiểm
-tra cổng nào đang mở bằng TCP connect, có timeout cho từng kết nối và quét song
-song bằng thread pool. Với mỗi cổng mở, chương trình hiển thị tên dịch vụ và thử
-đọc banner ngắn. Với CIDR, chương trình dò nhanh các host còn sống trước khi quét
-cổng. Kết quả có thể xuất ra báo cáo JSON/CSV.
+và lập trình socket. Hai giai đoạn được tách rời: `discover` dò host còn sống
+trong một dải CIDR, `scan` kiểm tra cổng nào đang mở trên một IP hoặc trên danh
+sách host bạn chọn. Mỗi kết nối có timeout riêng và được quét song song bằng
+thread pool. Với mỗi cổng mở, chương trình hiển thị tên dịch vụ và thử đọc banner
+ngắn. Kết quả có thể xuất ra báo cáo JSON/CSV.
 
-> Hiện tại: CLI quét IPv4 hoặc CIDR từ `/18` đến `/32`, tối đa 65535 cổng mỗi lần quét,
-> có hai mốc giới hạn cho **từng giai đoạn** (dò host sống và quét cổng): cảnh báo ở
-> 500.000 và trần cứng 5.000.000 lượt, nhận diện dịch vụ, banner, dò host sống, xuất
-> báo cáo JSON/CSV, kèm giao diện web cục bộ. Bước 1–5 đã hoàn thành.
+> Hiện tại: CLI tách hai giai đoạn (`discover` / `scan`) cho IPv4 và CIDR từ `/18`
+> đến `/32`, tối đa 65535 cổng mỗi lần quét, có hai mốc giới hạn cho **từng giai
+> đoạn** (cảnh báo ở 500.000 và trần cứng 5.000.000 lượt), nhận diện dịch vụ,
+> banner, xuất báo cáo JSON/CSV, kèm giao diện web cục bộ. Bước 1–5 đã hoàn thành.
 
 ## Yêu cầu
 
@@ -38,6 +38,7 @@ Port Scanner/
 ├── README.md
 ├── tests/             # kiểm thử tự động bằng unittest
 │   ├── test_batching.py
+│   ├── test_cli.py
 │   ├── test_limits.py
 │   ├── test_parsing.py
 │   ├── test_report.py
@@ -64,7 +65,10 @@ python -m unittest discover tests
   quét theo lô (chia lô, kết quả từng phần, hủy giữa các lô, giới hạn theo từng giai đoạn).
 - `tests/test_batching.py`: hàm chia lô cổng, đếm host của mục tiêu, sắp xếp kết quả theo IP.
 - `tests/test_limits.py`: hai mốc giới hạn cho từng giai đoạn, các hàm ước tính lượt và
-  ước tính thời gian, định dạng số/thời gian, thông báo lỗi và luồng kiểm tra của CLI.
+  ước tính thời gian, định dạng số/thời gian, thông báo lỗi và giới hạn của CLI.
+- `tests/test_cli.py`: hai subcommand `discover`/`scan`, `--hosts`/`--hosts-file`, từ
+  chối CIDR trong `scan`, kiểm tra dải nội bộ từng host, và cách gọi cũ không có
+  subcommand. Mọi kết nối đều được mock nên không chạm mạng.
 
 Mọi bài kiểm thử chỉ làm việc với `127.0.0.1`. Bài kiểm tra mục tiêu ngoài dải nội bộ
 dùng `mock` để khẳng định không có kết nối nào được mở ra ngoài loopback. Thư mục tạm
@@ -72,40 +76,70 @@ của bài kiểm thử nằm trong `reports/` (đã bị `.gitignore` bỏ qua)
 
 ## Cách chạy
 
+Hai giai đoạn, hai lệnh. `discover` dò host sống, `scan` quét cổng trên danh sách
+bạn chọn ở bước sau.
+
 ```powershell
-# Quét một máy, dải cổng 1-1024 (cũng là mặc định khi chạy không tham số)
-python main.py 127.0.0.1 --ports 1-1024
+# Giai đoạn 1: dò host sống trong CIDR, in danh sách và ghi file JSON
+python main.py discover 192.168.1.0/24 --output hosts.json
 
-# Quét một dải CIDR (từ /18 đến /32)
-python main.py 127.0.0.0/30 --ports 135,445
+# Giai đoạn 2: quét cổng trên danh sách host vừa dò được
+python main.py scan --hosts-file hosts.json --ports 22,80,443
 
-# Xuất báo cáo JSON (hoặc --format csv)
-python main.py 127.0.0.1 --ports 1-1024 --output reports/single.json --format json
+# Quét một IP đơn (không cần bước dò)
+python main.py scan 127.0.0.1 --ports 1-1024
+
+# Hoặc gõ host trực tiếp, phân cách bằng dấu phẩy
+python main.py scan --hosts 192.168.1.5,192.168.1.9 --ports 22,80,443
 ```
+
+Cách gọi cũ `python main.py 127.0.0.1 --ports 1-1024` (không có subcommand) vẫn
+chạy như `scan` với một IP đơn. Nếu dùng cách cũ mà mục tiêu là CIDR, chương trình
+từ chối và nhắc chạy `discover` trước.
 
 Lệnh giống nhau trên Windows, Linux và macOS. Xem đầy đủ các tham số ở bảng bên
 dưới, và các ví dụ kèm kết quả ở mục [Ví dụ chạy và kết quả](#ví-dụ-chạy-và-kết-quả).
 
 ## Tham số
 
+### `main.py discover <CIDR>`
+
+Chỉ dò host sống, **không** quét cổng.
+
 | Tham số | Mặc định | Mô tả |
 | --- | --- | --- |
-| `target` | `127.0.0.1` | Địa chỉ IPv4 hoặc dải CIDR từ /18 đến /32. |
+| `CIDR` | bắt buộc | Dải CIDR từ /18 đến /32, ví dụ `192.168.1.0/24`. |
+| `--discovery-ports` | `22,80,135,443,445` | Cổng dùng để dò host sống. |
+| `--discovery-timeout` | `0.3` | Thời gian chờ mỗi lần thử khi dò, tính bằng giây. |
+| `--concurrency` | `100` | Số luồng dò song song. |
+| `--output` | không ghi file | Ghi JSON `{cidr, discovery_ports, discovered_at, live_hosts}`; nếu chỉ ghi tên file thì đặt trong `reports/`. |
+| `--force` | không bật | Ghi đè file kết quả đã tồn tại mà không hỏi. |
+| `--yes` | không bật | Tự xác nhận dò CIDR ngoài dải nội bộ (vẫn in cảnh báo). |
+| `--confirm-large-scan` | không bật | Tự xác nhận khi giai đoạn dò vượt mốc `500.000` lượt. |
+
+### `main.py scan [IP] [--hosts ...] [--hosts-file ...]`
+
+Quét cổng trên một IP đơn **hoặc** danh sách host. Chỉ được chọn một trong ba
+nguồn host: `IP`, `--hosts`, `--hosts-file`.
+
+| Tham số | Mặc định | Mô tả |
+| --- | --- | --- |
+| `IP` | không có | Một địa chỉ IPv4 đơn. Không nhận CIDR. |
+| `--hosts` | không có | Danh sách host phân cách bằng dấu phẩy, ví dụ `192.168.1.5,192.168.1.9`. |
+| `--hosts-file` | không có | File JSON do `discover --output` tạo ra. |
 | `--ports` | `1-1024` | Dải cổng hoặc danh sách cổng, ví dụ `1-1024`, `22,80,443`, `8000-8100`; tối đa `1-65535`. |
 | `--timeout` | `1.0` | Thời gian chờ tối đa cho mỗi kết nối, tính bằng giây. |
 | `--banner-timeout` | `0.5` | Thời gian chờ đọc banner cho mỗi cổng mở, tính bằng giây. |
-| `--discovery-timeout` | `0.3` | Thời gian chờ dò host sống trong CIDR, tính bằng giây. |
-| `--discovery-ports` | `22,80,135,443,445` | Cổng dùng để dò host sống trong CIDR. |
 | `--workers` | `100` | Số luồng quét song song. |
 | `--force` | không bật | Ghi đè file báo cáo đã tồn tại mà không hỏi. |
 | `--yes` | không bật | Tự xác nhận mục tiêu ngoài dải nội bộ (vẫn in cảnh báo). |
-| `--confirm-large-scan` | không bật | Tự xác nhận cho giai đoạn vượt mốc `500.000` lượt (vẫn in cảnh báo). |
+| `--confirm-large-scan` | không bật | Tự xác nhận khi giai đoạn quét vượt mốc `500.000` lượt. |
 | `--output` | không ghi file | Đường dẫn file báo cáo; nếu chỉ ghi tên file thì đặt trong `reports/`. |
 | `--format` | `json` | Định dạng báo cáo: `json` hoặc `csv` (chỉ dùng khi có `--output`). |
 
 Mẹo tinh chỉnh: tăng `--timeout` nếu mạng chậm; tăng `--banner-timeout` nếu dịch
 vụ trả banner chậm; tăng `--discovery-timeout` nếu host phản hồi chậm; giảm
-`--workers` nếu muốn hạn chế số kết nối đồng thời.
+`--workers`/`--concurrency` nếu muốn hạn chế số kết nối đồng thời.
 
 ## Ví dụ chạy và kết quả
 
@@ -114,7 +148,7 @@ vụ trả banner chậm; tăng `--discovery-timeout` nếu host phản hồi ch
 Xem tên dịch vụ và banner:
 
 ```powershell
-python main.py 127.0.0.1 --ports 135,445,5357
+python main.py scan 127.0.0.1 --ports 135,445,5357
 ```
 
 ```text
@@ -128,36 +162,64 @@ Cổng mở trên 127.0.0.1:
 Hoàn tất: 3 cổng mở trong 0.53 giây.
 ```
 
-### Quét dải CIDR
+### Dò host sống rồi quét cổng trên host đã chọn
+
+Hai lệnh, hai giai đoạn. Trước hết dò host sống và lưu lại:
 
 ```powershell
-python main.py 127.0.0.0/30 --ports 1-1024
+python main.py discover 127.0.0.0/30 --discovery-ports 135,445 --output hosts.json
 ```
 
 ```text
-Đang kiểm tra host sống trong 127.0.0.0/30 (2 host, cổng dò 22,80,135,443,445, timeout 0.3s)...
+Đang dò host sống trong 127.0.0.0/30 (2 host, cổng dò 135,445, timeout 0.3s, 100 luồng)...
 [1/2] 127.0.0.2: sống
 [2/2] 127.0.0.1: sống
 
-Tìm thấy 2/2 host sống trong 0.61 giây.
+Tìm thấy 2/2 host sống trong 0.01 giây.
+Danh sách host sống:
+  127.0.0.1
+  127.0.0.2
+Đã ghi danh sách host sống: reports\hosts.json
+Dùng lại bằng: main.py scan --hosts-file reports\hosts.json --ports <dải cổng>
+```
 
-[1/2] Đang quét 127.0.0.1 (1024 cổng)...
+File `reports/hosts.json` có dạng:
+
+```json
+{
+  "cidr": "127.0.0.0/30",
+  "discovery_ports": "135,445",
+  "discovered_at": "2026-10-26T22:51:12+07:00",
+  "live_hosts": ["127.0.0.1", "127.0.0.2"]
+}
+```
+
+Sau khi xem danh sách (và có thể sửa bớt host), quét cổng ở bước riêng:
+
+```powershell
+python main.py scan --hosts-file reports/hosts.json --ports 135,445 --timeout 0.3
+```
+
+```text
+Đang quét 2 host với 2 cổng (timeout 0.3s, banner 0.5s, 100 luồng)...
+
+[1/2] Đang quét 127.0.0.1 (2 cổng)...
 Cổng mở trên 127.0.0.1:
   135/tcp  msrpc
   445/tcp  microsoft-ds
-Hoàn tất host 127.0.0.1: 2 cổng mở trong 11.68 giây.
+Hoàn tất host 127.0.0.1: 2 cổng mở trong 0.53 giây.
 
-[2/2] Đang quét 127.0.0.2 (1024 cổng)...
+[2/2] Đang quét 127.0.0.2 (2 cổng)...
 Cổng mở trên 127.0.0.2:
   135/tcp  msrpc
   445/tcp  microsoft-ds
-Hoàn tất host 127.0.0.2: 2 cổng mở trong 11.66 giây.
+Hoàn tất host 127.0.0.2: 2 cổng mở trong 0.52 giây.
 
-Tổng cộng: 2 host sống, 4 cổng mở.
+Tổng cộng: 2 host, 4 cổng mở.
 ```
 
-Thứ tự các dòng tiến độ có thể khác thứ tự host vì các host được dò song song;
-kết quả quét vẫn được in theo thứ tự địa chỉ.
+Thứ tự các dòng tiến độ khi dò có thể khác thứ tự host vì các host được dò song
+song; danh sách host sống và kết quả quét vẫn được in theo thứ tự địa chỉ.
 
 ### Xuất báo cáo JSON/CSV
 
@@ -165,9 +227,9 @@ Thư mục `reports/` được tạo tự động; nếu `--output` chỉ là t�
 ghi vào `reports/`:
 
 ```powershell
-python main.py 127.0.0.1 --ports 1-1024 --output reports/single.json --format json
-python main.py 127.0.0.1 --ports 1-1024 --output reports/single.csv --format csv
-python main.py 127.0.0.0/30 --ports 1-1024 --output reports/cidr.json --format json
+python main.py scan 127.0.0.1 --ports 1-1024 --output single.json --format json
+python main.py scan 127.0.0.1 --ports 1-1024 --output single.csv --format csv
+python main.py scan --hosts-file reports/hosts.json --ports 1-1024 --output cidr.json
 ```
 
 Nội dung file mẫu xem ở mục [Xuất báo cáo JSON/CSV](#xuất-báo-cáo-jsoncsv).
@@ -176,20 +238,22 @@ Nội dung file mẫu xem ở mục [Xuất báo cáo JSON/CSV](#xuất-báo-cá
 
 ```powershell
 # Quét vài cổng với timeout 1 giây
-python main.py 192.168.1.10 --ports 22,80,443 --timeout 1
+python main.py scan 192.168.1.10 --ports 22,80,443 --timeout 1
 
 # Ghi đè báo cáo đã tồn tại mà không hỏi
-python main.py 127.0.0.1 --ports 1-1024 --output reports/single.json --format json --force
+python main.py scan 127.0.0.1 --ports 1-1024 --output single.json --force
 
 # Tự xác nhận mục tiêu ngoài dải nội bộ (chỉ dùng khi có quyền quét)
-python main.py 203.0.113.10 --ports 53 --yes
+python main.py scan 203.0.113.10 --ports 53 --yes
 
-# Chỉ dò host sống qua cổng 135
-python main.py 127.0.0.0/30 --ports 135,445 --discovery-ports 135
+# Dò host sống chỉ qua cổng 135, rồi quét danh sách gõ tay
+python main.py discover 127.0.0.0/30 --discovery-ports 135
+python main.py scan --hosts 127.0.0.1,127.0.0.2 --ports 135,445
 ```
 
 Khi chạy không tương tác (stdin không phải terminal), cần `--yes` để xác nhận mục
-tiêu ngoài dải nội bộ và `--force` để ghi đè báo cáo.
+tiêu ngoài dải nội bộ, `--force` để ghi đè file, và `--confirm-large-scan` khi một
+giai đoạn vượt mốc cảnh báo.
 
 ## Cách hoạt động
 
@@ -199,21 +263,27 @@ công — nghĩa là có tiến trình đang lắng nghe trên cổng đó. Các
 `ECONNREFUSED` (cổng đóng) hoặc timeout được coi là cổng không mở. Mỗi kết nối
 có timeout riêng nên chương trình không bị treo khi gói tin bị drop.
 
-## Quét CIDR và dò host sống
+## Dò host sống và quét cổng là hai bước tách rời
 
-Khi nhận CIDR, chương trình dùng `ipaddress` mở rộng dải thành danh sách host
-(bỏ địa chỉ mạng và broadcast khi có thể). CIDR có host bits sẽ được chuẩn hóa về
-địa chỉ mạng trước khi quét. Dải lớn hơn `/18` bị từ chối ngay, không hỏi lại.
+CLI cố tình **không** tự chạy nối tiếp hai giai đoạn. Lý do: giới hạn của giai đoạn
+quét cổng phải dựa trên số host thật. Nếu tự dò rồi tự quét, lúc kiểm tra giới hạn
+chương trình chỉ biết số host tối đa của dải nên phải ước tính trường hợp xấu nhất
+(mọi host đều sống), khiến con số luôn cao hơn thực tế rất nhiều.
 
-Trước khi quét toàn bộ dải cổng, chương trình thử TCP connect tới các cổng trong
-`--discovery-ports` (mặc định `22,80,135,443,445`) với timeout ngắn
-(`--discovery-timeout`) để loại nhanh các host không phản hồi; chỉ host sống mới
-được quét kỹ. Cách này tránh quét toàn bộ cổng trên các địa chỉ không tồn tại, vốn
-rất tốn thời gian. Tiến độ được in theo dạng `[đã xong/tổng] host`. Host chỉ mở
-cổng nằm ngoài danh sách dò có thể bị bỏ qua.
+Quy trình hai bước:
 
-Với một địa chỉ IP đơn lẻ, chương trình quét trực tiếp (không dò host) để không
-bỏ sót host chỉ mở cổng không nằm trong danh sách dò.
+1. `main.py discover <CIDR>` mở rộng dải bằng `ipaddress` (bỏ địa chỉ mạng và
+   broadcast khi có thể, chuẩn hóa host bits về địa chỉ mạng), rồi thử TCP connect
+   tới các cổng trong `--discovery-ports` với timeout ngắn `--discovery-timeout`.
+   Host phản hồi ở ít nhất một cổng được coi là sống. Tiến độ in theo dạng
+   `[đã xong/tổng] host`. Dải lớn hơn `/18` bị từ chối ngay.
+2. `main.py scan --hosts-file <file>` hoặc `--hosts ip1,ip2` quét cổng trên đúng
+   danh sách đó. Số host dùng để kiểm tra giới hạn là **số phần tử thật** của danh
+   sách, nên không còn phép ước tính nào.
+
+Host chỉ mở cổng nằm ngoài danh sách dò có thể bị `discover` bỏ qua — đó là lý do
+danh sách host được ghi ra file để bạn xem và sửa trước khi quét. Với một địa chỉ IP
+đơn, `scan` quét trực tiếp (không dò) để không bỏ sót trường hợp đó.
 
 ## Nhận diện dịch vụ và banner
 
@@ -454,38 +524,35 @@ mục tiêu ngoài dải nội bộ, `404` id không tồn tại, `409` đang c�
 
 ## Hai mốc giới hạn cho từng giai đoạn
 
-Một lần quét CIDR có hai giai đoạn, và mỗi giai đoạn được đánh giá **độc lập**:
+Mỗi lệnh chỉ chạy **một** giai đoạn, và giới hạn được tính bằng số liệu thật của
+chính giai đoạn đó:
 
 ```text
-giai đoạn 1 — dò host sống:  số host tối đa của dải × số cổng dò host
-giai đoạn 2 — quét cổng:     số host tối đa của dải × số cổng quét   (ước tính trước khi chạy)
-                             số host sống thực tế   × số cổng quét   (kiểm tra thật sau khi dò)
+discover:  số host tối đa của dải CIDR × số cổng dò host
+scan:      số host trong danh sách      × số cổng quét
 ```
 
-Hai con số này **không bao giờ được cộng lại**: giai đoạn dò được so với hai mốc bằng
-con số của riêng nó, giai đoạn quét cũng vậy. Một IP đơn không có giai đoạn dò, chỉ có
-giai đoạn quét với số host bằng `1` (`1 × số cổng`).
+Không có phép cộng hai giai đoạn, và ở `scan` cũng không còn phép ước tính "xấu
+nhất": danh sách host đã biết chắc chắn nên con số là thật. Một IP đơn chỉ có giai
+đoạn quét với số host bằng `1` (`1 × số cổng`).
 
-Ví dụ với `127.0.0.0/18`, cổng `1-1024`, 5 cổng dò mặc định:
+Ví dụ với `127.0.0.0/18` và 5 cổng dò mặc định:
 
-- dò host: `16382 × 5 = 81.910` lượt — dưới mốc cảnh báo nên giai đoạn này được chạy;
-- quét cổng (ước tính): `16382 × 1024 = 16.775.168` lượt — vượt trần cứng nên bị từ
-  chối **ngay từ đầu**, không cần đợi dò xong, và thông báo nêu rõ đây là giai đoạn
-  quét cổng vượt chứ không phải giai đoạn dò.
+- `main.py discover 127.0.0.0/18` → `16382 × 5 = 81.910` lượt, dưới mốc cảnh báo
+  nên chạy bình thường;
+- sau khi dò xong, nếu danh sách chỉ có 12 host thì `main.py scan --hosts-file ...`
+  với `1-1024` chỉ tính `12 × 1024 = 12.288` lượt — thay vì `16.775.168` lượt của
+  cách ước tính theo số host tối đa.
 
 | Mốc | Giá trị | Hành vi cho **mỗi giai đoạn** |
 | --- | --- | --- |
 | Cảnh báo | `500.000` lượt | CLI in cảnh báo nêu tên giai đoạn, kèm ước tính thời gian và yêu cầu `--confirm-large-scan` (hoặc trả lời `y` khi chạy tương tác). Web trả `202` kèm `confirmation_required: true` và danh sách `stages` vượt mốc, **chưa chạy gì**; phải gọi lại với `"confirm": true`. |
 | Trần cứng | `5.000.000` lượt | Từ chối hẳn: CLI báo lỗi nêu tên giai đoạn và thoát khác `0`, web trả `400`. **Không có cờ nào vượt qua**, và không mở kết nối nào trước khi từ chối. |
 
-Sau khi dò host sống xong, giai đoạn quét cổng được kiểm tra lại bằng số host sống
-thực tế. Nếu vượt trần cứng ở bước này, job dừng với trạng thái lỗi và thông báo nêu
-rõ số host sống thực tế (khác với ước tính ban đầu theo số host tối đa). Trong thực tế
-bước này hiếm khi kích hoạt vì ước tính theo số host tối đa đã là trường hợp lớn nhất.
-
 Thông báo khi vượt trần nêu rõ cách giảm: bớt số cổng, bớt cổng dò host, hoặc thu nhỏ
-dải CIDR. Ước tính thời gian dùng công thức `số lượt × timeout / số luồng`, tức trường
-hợp xấu nhất khi mọi kết nối đều hết thời gian chờ.
+dải CIDR (với `scan` là bớt host trong danh sách). Ước tính thời gian dùng công thức
+`số lượt × timeout / số luồng`, tức trường hợp xấu nhất khi mọi kết nối đều hết thời
+gian chờ.
 
 > **Rủi ro khi quét dải lớn.** Quét vài chục nghìn host × vài chục nghìn cổng có
 > thể làm chậm mạng của bạn, chiếm nhiều kết nối đồng thời, và rất dễ bị hệ thống
@@ -497,10 +564,13 @@ hợp xấu nhất khi mọi kết nối đều hết thời gian chờ.
 ## An toàn
 
 - Chỉ quét máy của bạn, mạng nhà bạn hoặc máy ảo lab.
-- Nếu mục tiêu (IP hoặc CIDR) nằm ngoài các dải nội bộ (`10.0.0.0/8`,
-  `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`), chương trình sẽ cảnh báo
-  và yêu cầu xác nhận trước khi quét; dùng `--yes` khi chạy không tương tác và
-  chỉ khi bạn có quyền quét.
+- Nếu mục tiêu (IP của `scan` hoặc CIDR của `discover`) nằm ngoài các dải nội bộ
+  (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`), chương trình
+  sẽ cảnh báo và yêu cầu xác nhận trước khi chạy; dùng `--yes` khi chạy không
+  tương tác và chỉ khi bạn có quyền quét.
+- Mọi host trong `--hosts` và `--hosts-file` bị kiểm tra **từng địa chỉ**: host
+  không phải IPv4 hợp lệ hoặc nằm ngoài dải nội bộ bị từ chối hẳn, không có cờ nào
+  bỏ qua.
 - Dải CIDR lớn hơn `/18` bị từ chối ngay, không hỏi lại.
 - Mỗi giai đoạn vượt `500.000` lượt phải được xác nhận thêm (`--confirm-large-scan`
   trên CLI, hoặc bước xác nhận riêng trên web); giai đoạn nào vượt `5.000.000` lượt
