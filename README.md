@@ -7,7 +7,10 @@ song bằng thread pool. Với mỗi cổng mở, chương trình hiển thị t
 đọc banner ngắn. Với CIDR, chương trình dò nhanh các host còn sống trước khi quét
 cổng. Kết quả có thể xuất ra báo cáo JSON/CSV.
 
-> Hiện tại: CLI quét IPv4/CIDR tối đa /24, nhận diện dịch vụ, banner, dò host sống, xuất báo cáo JSON/CSV, kèm giao diện web cục bộ. Bước 1–5 đã hoàn thành.
+> Hiện tại: CLI quét IPv4 hoặc CIDR từ `/18` đến `/32`, tối đa 65535 cổng mỗi lần quét,
+> có hai mốc giới hạn tổng lượt quét (cảnh báo ở 500.000 và trần cứng 5.000.000), nhận
+> diện dịch vụ, banner, dò host sống, xuất báo cáo JSON/CSV, kèm giao diện web cục bộ.
+> Bước 1–5 đã hoàn thành.
 
 ## Yêu cầu
 
@@ -26,7 +29,7 @@ cd Port-Scanner
 ```text
 Port Scanner/
 ├── .gitignore
-├── AGENTS.md          # hướng dẫn nội bộ (bị .gitignore bỏ qua)
+├── AGENTS.md          # hướng dẫn nội bộ cho agent
 ├── main.py            # CLI, tham số, điều phối quét
 ├── report.py          # xuất báo cáo JSON/CSV
 ├── scanner.py         # quét cổng, dò host, đọc banner
@@ -35,6 +38,7 @@ Port Scanner/
 ├── README.md
 ├── tests/             # kiểm thử tự động bằng unittest
 │   ├── test_batching.py
+│   ├── test_limits.py
 │   ├── test_parsing.py
 │   ├── test_report.py
 │   └── test_web_server.py
@@ -58,8 +62,9 @@ python -m unittest discover tests
 - `tests/test_web_server.py`: API của web server — token, Host/Origin, giới hạn mục tiêu,
   giới hạn số cổng và số luồng, hai lần quét cùng lúc, hủy quét, banner chứa HTML,
   quét theo lô (chia lô, kết quả từng phần, hủy giữa các lô, giới hạn tổng lượt thử).
-- `tests/test_batching.py`: hàm chia lô cổng, đếm host của mục tiêu, giới hạn tổng
-  lượt thử và sắp xếp kết quả theo IP.
+- `tests/test_batching.py`: hàm chia lô cổng, đếm host của mục tiêu, sắp xếp kết quả theo IP.
+- `tests/test_limits.py`: hai mốc giới hạn tổng lượt quét, các hàm ước tính lượt và ước
+  tính thời gian, định dạng số/thời gian và thông báo lỗi.
 
 Mọi bài kiểm thử chỉ làm việc với `127.0.0.1`. Bài kiểm tra mục tiêu ngoài dải nội bộ
 dùng `mock` để khẳng định không có kết nối nào được mở ra ngoài loopback. Thư mục tạm
@@ -71,7 +76,7 @@ của bài kiểm thử nằm trong `reports/` (đã bị `.gitignore` bỏ qua)
 # Quét một máy, dải cổng 1-1024 (cũng là mặc định khi chạy không tham số)
 python main.py 127.0.0.1 --ports 1-1024
 
-# Quét một dải CIDR (tối đa /24)
+# Quét một dải CIDR (từ /18 đến /32)
 python main.py 127.0.0.0/30 --ports 135,445
 
 # Xuất báo cáo JSON (hoặc --format csv)
@@ -85,8 +90,8 @@ dưới, và các ví dụ kèm kết quả ở mục [Ví dụ chạy và kết
 
 | Tham số | Mặc định | Mô tả |
 | --- | --- | --- |
-| `target` | `127.0.0.1` | Địa chỉ IPv4 hoặc dải CIDR tối đa /24. |
-| `--ports` | `1-1024` | Dải cổng hoặc danh sách cổng, ví dụ `1-1024`, `22,80,443`, `8000-8100`. |
+| `target` | `127.0.0.1` | Địa chỉ IPv4 hoặc dải CIDR từ /18 đến /32. |
+| `--ports` | `1-1024` | Dải cổng hoặc danh sách cổng, ví dụ `1-1024`, `22,80,443`, `8000-8100`; tối đa `1-65535`. |
 | `--timeout` | `1.0` | Thời gian chờ tối đa cho mỗi kết nối, tính bằng giây. |
 | `--banner-timeout` | `0.5` | Thời gian chờ đọc banner cho mỗi cổng mở, tính bằng giây. |
 | `--discovery-timeout` | `0.3` | Thời gian chờ dò host sống trong CIDR, tính bằng giây. |
@@ -94,6 +99,7 @@ dưới, và các ví dụ kèm kết quả ở mục [Ví dụ chạy và kết
 | `--workers` | `100` | Số luồng quét song song. |
 | `--force` | không bật | Ghi đè file báo cáo đã tồn tại mà không hỏi. |
 | `--yes` | không bật | Tự xác nhận mục tiêu ngoài dải nội bộ (vẫn in cảnh báo). |
+| `--confirm-large-scan` | không bật | Tự xác nhận khi lần quét vượt mốc `500.000` lượt (vẫn in cảnh báo). |
 | `--output` | không ghi file | Đường dẫn file báo cáo; nếu chỉ ghi tên file thì đặt trong `reports/`. |
 | `--format` | `json` | Định dạng báo cáo: `json` hoặc `csv` (chỉ dùng khi có `--output`). |
 
@@ -197,7 +203,7 @@ có timeout riêng nên chương trình không bị treo khi gói tin bị drop.
 
 Khi nhận CIDR, chương trình dùng `ipaddress` mở rộng dải thành danh sách host
 (bỏ địa chỉ mạng và broadcast khi có thể). CIDR có host bits sẽ được chuẩn hóa về
-địa chỉ mạng trước khi quét. Dải lớn hơn `/24` bị từ chối ngay, không hỏi lại.
+địa chỉ mạng trước khi quét. Dải lớn hơn `/18` bị từ chối ngay, không hỏi lại.
 
 Trước khi quét toàn bộ dải cổng, chương trình thử TCP connect tới các cổng trong
 `--discovery-ports` (mặc định `22,80,135,443,445`) với timeout ngắn
@@ -303,23 +309,45 @@ Sau đó mở địa chỉ mà chương trình in ra, ví dụ
 
 Giao diện gồm:
 
-- **Địa chỉ IP** và ô **CIDR, tùy chọn** (prefix `24`–`32`) nằm cùng hàng, ngăn bởi
+- **Địa chỉ IP** và ô **CIDR, tùy chọn** (prefix `18`–`32`) nằm cùng hàng, ngăn bởi
   dấu `/`. Để trống prefix là quét một máy; điền prefix là quét cả dải. Ví dụ IP
   `192.168.1.10` với prefix `24` sẽ gửi lên `192.168.1.10/24` và server chuẩn hóa
   thành `192.168.1.0/24`.
 - **Dòng xem trước** ngay dưới ô nhập, cập nhật khi gõ: `192.168.1.0/24 → 254 host,
-  từ 192.168.1.1 đến 192.168.1.254`, hoặc `127.0.0.1 → 1 host`. Phần chuẩn hóa và
-  đếm host được tính giống `ipaddress.ip_network(..., strict=False)`.
-- **Dải cổng** kèm ba chip bấm một lần để điền: `Phổ biến`, `1-1024`, `Web`.
+  từ 192.168.1.1 đến 192.168.1.254 · ≈ 261.366 lượt quét, khoảng 43 phút`. Phần
+  chuẩn hóa và đếm host được tính giống `ipaddress.ip_network(..., strict=False)`,
+  phần ước tính giống công thức của server.
+- **Dải cổng** kèm ba chip bấm một lần để điền: `Phổ biến`, `1-1024`, `Web`; nhận
+  tới `1-65535`.
+- **Tùy chọn nâng cao** (mặc định thu gọn, bấm để mở) gồm năm trường tương ứng tham
+  số CLI. Mỗi trường có placeholder là giá trị mặc định của server:
+
+  | Trường | Tham số API | Mặc định | Giới hạn server kiểm tra |
+  | --- | --- | --- | --- |
+  | Timeout mỗi kết nối (giây) | `timeout` | `1.0` | `0.05`–`10` |
+  | Timeout đọc banner (giây) | `banner_timeout` | `0.5` | `0.05`–`10` |
+  | Timeout dò host (giây) | `discovery_timeout` | `0.3` | `0.05`–`10` |
+  | Cổng dò host sống | `discovery_ports` | `22,80,135,443,445` | dải cổng hợp lệ, tối đa 64 cổng |
+  | Số luồng song song | `workers` | `100` | `1`–`100` |
+
+  Để trống một trường nghĩa là dùng mặc định. Giao diện kiểm tra định dạng và khoảng
+  để hỗ trợ nhập liệu, nhưng **server luôn kiểm tra lại** và là nơi quyết định.
 - **Quét** / **Hủy quét**; nhấn Enter trong ô nhập cũng bắt đầu quét. Trong lúc
-  chạy, các ô nhập và nút Quét bị vô hiệu hóa, chỉ nút Hủy còn bật.
+  chạy, các ô nhập, chip, tùy chọn nâng cao và nút Quét bị vô hiệu hóa, chỉ nút Hủy
+  còn bật.
+- **Cảnh báo quét lớn**: khi ước tính vượt `500.000` lượt, dòng xem trước chuyển
+  sang hộp cảnh báo màu nổi bật kèm nút **Xác nhận quét lớn và bắt đầu**. Nếu vượt
+  trần cứng `5.000.000` lượt, hộp cảnh báo nói rõ server sẽ từ chối và nút xác nhận
+  không hiện.
 - **Vùng tiến độ** (`aria-live="polite"`) hiển thị giai đoạn (dò host sống / quét
   cổng), lô đang chạy, số host đã xong, số cổng đã quét trên tổng số cổng của cả
   job và thời gian đã trôi qua.
 - **Bảng kết quả** (host, cổng, dịch vụ, banner), sắp xếp theo địa chỉ IP bằng so
   sánh số rồi theo cổng; banner rỗng hiện `—`, banner dài được cắt gọn và hiện đầy
   đủ khi rê chuột. Bảng tự cập nhật sau mỗi lô, không chờ hết cả job. Nhãn "Kết quả
-  một phần" hiện khi còn lô chưa chạy, khi bị hủy hoặc khi lỗi.
+  một phần" hiện khi còn lô chưa chạy, khi bị hủy hoặc khi lỗi. Dòng dưới tiêu đề
+  ghi lại đúng tham số của lần quét đã chạy (kể cả tùy chọn nâng cao khác mặc định),
+  không lấy từ ô nhập hiện tại.
 - Hai nút **tải JSON/CSV**, và giao diện tự chuyển màu theo chế độ tối của hệ điều
   hành (`prefers-color-scheme`) và co giãn trên màn hình hẹp.
 
@@ -353,7 +381,7 @@ Hằng số kích thước lô nằm ở một chỗ duy nhất trong `web_serve
 | Phương thức | Đường dẫn | Mô tả |
 | --- | --- | --- |
 | `GET` | `/` | Trang giao diện, kèm token của phiên. |
-| `POST` | `/api/scan` | Bắt đầu quét. Body JSON: `{"target": "...", "ports": "..."}`. Trả `202` kèm `id`. Trường `target` là `"ip"` hoặc `"ip/prefix"`. |
+| `POST` | `/api/scan` | Bắt đầu quét. Body JSON: `{"target": "...", "ports": "...", ...}`. Trả `202` kèm `id`, hoặc `202` kèm `confirmation_required: true` khi vượt mốc cảnh báo. Trường `target` là `"ip"` hoặc `"ip/prefix"`. |
 | `GET` | `/api/scan/<id>` | Trạng thái, tiến độ và kết quả của một lần quét. |
 | `POST` | `/api/scan/<id>/cancel` | Yêu cầu hủy lần quét đang chạy. |
 | `GET` | `/api/scan/<id>/download?format=json\|csv` | Tải báo cáo, dùng lại `report.py`. Tải được cả khi job đang chạy hoặc đã bị hủy: chỉ trả những kết quả đã có. |
@@ -405,14 +433,11 @@ mục tiêu ngoài dải nội bộ, `404` id không tồn tại, `409` đang c�
   - mục tiêu phải thuộc dải nội bộ (`10.0.0.0/8`, `172.16.0.0/12`,
     `192.168.0.0/16`, `127.0.0.0/8`), ngoài dải thì từ chối hẳn — trên web
     **không có** cơ chế xác nhận để quét mục tiêu ngoài;
-  - CIDR lớn hơn `/24` bị từ chối;
+  - CIDR lớn hơn `/18` bị từ chối;
   - tối đa `65535` cổng mỗi job, chia thành các lô `2048` cổng;
-  - **giới hạn tổng `262144` lượt thử** cho cả job (tương đương 256 host × 1024
-    cổng), vì dải lớn nhân nhiều máy sẽ rất nặng. Giới hạn này được kiểm tra cả
-    khi bắt đầu job (dùng số host tối đa của dải) lẫn sau khi dò host sống (dùng
-    số host thực tế). Vượt quá thì trả `400` kèm hướng dẫn giảm số cổng hoặc thu
-    nhỏ dải CIDR, và **không mở kết nối nào**;
-  - tối đa `100` luồng; timeout do server cố định.
+  - hai mốc giới hạn tổng lượt quét (xem mục "Hai mốc giới hạn" bên dưới);
+  - tối đa `100` luồng; các timeout do server kiểm tra lại theo khoảng cho phép
+    (`0.05`–`10` giây) dù giao diện gửi lên giá trị nào.
 - Chống bị trang web khác lợi dụng: kiểm tra header `Host` (chỉ nhận
   `127.0.0.1:<cổng>` hoặc `localhost:<cổng>`), kiểm tra `Origin` với mọi request
   `POST`, và bắt buộc gửi token ngẫu nhiên sinh bằng `secrets` mỗi lần khởi động
@@ -423,6 +448,35 @@ mục tiêu ngoài dải nội bộ, `404` id không tồn tại, `409` đang c�
 - Mọi dữ liệu hiển thị (banner, tên dịch vụ) được chèn bằng `textContent`, không
   bao giờ gán chuỗi HTML — banner do máy bị quét kiểm soát nên có thể chứa mã độc.
 
+## Hai mốc giới hạn tổng lượt quét
+
+Một lần quét được ước tính bằng **tổng số lượt quét**:
+
+```text
+trước khi dò host sống:  số host tối đa của dải × (số cổng quét + số cổng dò host)
+sau khi dò host sống:    số host sống thực tế   ×  số cổng quét
+```
+
+Ví dụ: `/18` có 16382 host, nên `/18` × `1-65535` ước tính khoảng
+`16382 × 65540 ≈ 1,07 tỷ` lượt. Một IP đơn không có bước dò host nên chỉ tính
+`1 × số cổng`.
+
+| Mốc | Giá trị | Hành vi |
+| --- | --- | --- |
+| Cảnh báo | `500.000` lượt | CLI in cảnh báo kèm ước tính thời gian và yêu cầu `--confirm-large-scan` (hoặc trả lời `y` khi chạy tương tác). Web trả `202` kèm `confirmation_required: true` và **chưa chạy gì**; phải gọi lại với `"confirm": true`. |
+| Trần cứng | `5.000.000` lượt | Từ chối hẳn: CLI báo lỗi và thoát khác `0`, web trả `400`. **Không có cờ nào vượt qua**, và không mở kết nối nào trước khi từ chối. |
+
+Thông báo khi vượt trần nêu rõ cách giảm: bớt số cổng hoặc thu nhỏ dải CIDR.
+Ước tính thời gian dùng công thức `số lượt × timeout / số luồng`, tức trường hợp
+xấu nhất khi mọi kết nối đều hết thời gian chờ.
+
+> **Rủi ro khi quét dải lớn.** Quét vài chục nghìn host × vài chục nghìn cổng có
+> thể làm chậm mạng của bạn, chiếm nhiều kết nối đồng thời, và rất dễ bị hệ thống
+> an ninh mạng (firewall, IDS/IPS) phát hiện và chặn. Mốc `500.000` lượt ở mặc
+> định đã tương đương khoảng `1,4 giờ`, còn `5.000.000` lượt khoảng `14 giờ` liên
+> tục. Chỉ quét dải lớn trên mạng của chính bạn, và cân nhắc giảm số cổng hoặc
+> thu nhỏ dải CIDR trước.
+
 ## An toàn
 
 - Chỉ quét máy của bạn, mạng nhà bạn hoặc máy ảo lab.
@@ -430,7 +484,10 @@ mục tiêu ngoài dải nội bộ, `404` id không tồn tại, `409` đang c�
   `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`), chương trình sẽ cảnh báo
   và yêu cầu xác nhận trước khi quét; dùng `--yes` khi chạy không tương tác và
   chỉ khi bạn có quyền quét.
-- Dải CIDR lớn hơn `/24` bị từ chối ngay, không hỏi lại.
+- Dải CIDR lớn hơn `/18` bị từ chối ngay, không hỏi lại.
+- Lần quét vượt `500.000` lượt phải được xác nhận thêm (`--confirm-large-scan`
+  trên CLI, hoặc bước xác nhận riêng trên web); vượt `5.000.000` lượt bị từ chối
+  hẳn, không có cách vượt qua.
 - Quét cổng trên hệ thống không thuộc quyền của bạn khi chưa được phép có thể vi phạm pháp luật.
 - Web server chỉ lắng nghe trên `127.0.0.1`; nếu cần dùng từ máy khác thì phải tự
   cân nhắc rủi ro, không mở rộng địa chỉ bind trong công cụ này.
