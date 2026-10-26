@@ -303,10 +303,17 @@ có `--output`, chương trình chỉ in ra màn hình. `--format` chọn `json`
 hoặc `csv`. Nếu `--output` chỉ là tên file, báo cáo được đặt trong `reports/` và
 thư mục này được tạo tự động.
 
-- JSON có `metadata` ở đầu (mục tiêu, dải cổng, tổng số cổng mở, thời gian quét
-  `scan_duration_seconds`) và danh sách `results`.
+- JSON có `metadata` ở đầu và danh sách `results`. `metadata` gồm:
+  - `target` — nhãn hiển thị: địa chỉ IP khi quét một host, hoặc `"N host"` khi
+    quét danh sách (giữ trường cũ để không phá định dạng đang dùng);
+  - `target_hosts` — **danh sách host thật đã quét** (mới), ví dụ
+    `["127.0.0.1", "127.0.0.2"]`, đúng thứ tự gửi lên, không trùng;
+  - `hosts_count` — số host trong `target_hosts`;
+  - `port_range`, `total_open_ports`, `scan_duration_seconds` như cũ; bản tải từ
+    web có thêm `batches_completed` và `batches_total`.
 - CSV có các cột `host,port,protocol,service,banner,scanned_at`; module `csv`
-  tự quote banner có dấu phẩy, xuống dòng hoặc dấu nháy. File dùng UTF-8.
+  tự quote banner có dấu phẩy, xuống dòng hoặc dấu nháy. File dùng UTF-8. CSV không
+  có phần metadata, chỉ có các dòng kết quả.
 - Mỗi bản ghi có `scanned_at` theo ISO 8601; `banner` là `null` trong JSON hoặc
   trường rỗng trong CSV nếu không đọc được.
 - Nếu file đã tồn tại, chương trình hỏi `Ghi đè? [y/N]`; dùng `--force` để ghi đè
@@ -314,12 +321,14 @@ thư mục này được tạo tự động.
   không ghi đè.
 - Lỗi đường dẫn/không ghi được hoặc định dạng sai được báo rõ.
 
-Ví dụ JSON:
+Ví dụ JSON (quét một host):
 
 ```json
 {
   "metadata": {
     "target": "127.0.0.1",
+    "target_hosts": ["127.0.0.1"],
+    "hosts_count": 1,
     "port_range": "1-1024",
     "total_open_ports": 2,
     "scan_duration_seconds": 11.688
@@ -354,9 +363,9 @@ host,port,protocol,service,banner,scanned_at
 ```
 
 Khi quét nhiều host (qua `--hosts` hoặc `--hosts-file`), tất cả host nằm trong cùng
-một mảng `results`; `metadata.target` là nhãn `"N host"` và có thêm `hosts_count`.
-Thư mục `reports/` nằm trong `.gitignore` để kết quả quét (có thể chứa IP nội bộ)
-không bị đưa lên GitHub.
+một mảng `results`; `metadata.target` là nhãn `"N host"`, còn `metadata.target_hosts`
+liệt kê đầy đủ các host đã quét. Thư mục `reports/` nằm trong `.gitignore` để kết quả
+quét (có thể chứa IP nội bộ) không bị đưa lên GitHub.
 
 ## Giao diện web
 
@@ -378,28 +387,30 @@ python web_server.py --port 8080
 Sau đó mở địa chỉ mà chương trình in ra, ví dụ
 [http://127.0.0.1:8000/](http://127.0.0.1:8000/).
 
-> **Đang chuyển sang luồng hai bước.** Server đã tách hai loại job `discover` và
-> `scan` (xem mục [API](#api) bên dưới). Trang HTML trong bản này vẫn dùng luồng
-> một-bước cũ nên tạm thời chỉ dùng được qua API; giao diện sẽ được cập nhật ở
-> bước tiếp theo.
+Trang có **hai khối độc lập**, xếp theo đúng thứ tự công việc:
 
-Giao diện gồm:
+### Khối 1 — Dò host sống
 
-- **Địa chỉ IP** và ô **CIDR, tùy chọn** (prefix `18`–`32`) nằm cùng hàng, ngăn bởi
-  dấu `/`. Để trống prefix là quét một máy; điền prefix là quét cả dải. Ví dụ IP
-  `192.168.1.10` với prefix `24` sẽ gửi lên `192.168.1.10/24` và server chuẩn hóa
-  thành `192.168.1.0/24`.
-- **Dòng xem trước** ngay dưới ô nhập, cập nhật khi gõ: `192.168.1.0/24 → 254 host,
-  từ 192.168.1.1 đến 192.168.1.254`. Ngay dưới đó là **hai dòng ước tính riêng**, ví dụ:
-  `Lượt dò (ước tính): 1.270 · khoảng 4 giây` và `Lượt quét cổng (ước tính theo số host
-  tối đa): 260.096 · khoảng 43 phút`. Hai giai đoạn không bao giờ được cộng lại; mỗi
-  dòng tự đổi màu khi vượt mốc của chính nó (vàng: cần xác nhận, đỏ: vượt trần cứng).
-  Phần chuẩn hóa và đếm host được tính giống `ipaddress.ip_network(..., strict=False)`,
-  phần ước tính giống công thức của server.
-- **Dải cổng** kèm ba chip bấm một lần để điền: `Phổ biến`, `1-1024`, `Web`; nhận
-  tới `1-65535`.
-- **Tùy chọn nâng cao** (mặc định thu gọn, bấm để mở) gồm năm trường tương ứng tham
-  số CLI. Mỗi trường có placeholder là giá trị mặc định của server:
+- Ô **Dải CIDR** (prefix `18`–`32`), ví dụ `192.168.1.0/24`. Dòng xem trước hiện
+  dải đã chuẩn hóa và số host, kèm **một dòng ước tính của riêng giai đoạn dò**:
+  `Lượt dò (ước tính): 1.270 (254 host × 5 cổng dò) · khoảng 4 giây`. Dòng này tự
+  đổi màu khi vượt mốc (vàng: cần xác nhận, đỏ: vượt trần cứng).
+- **Tùy chọn nâng cao** (thu gọn): `discovery_ports`, `discovery_timeout`,
+  `concurrency` — placeholder là giá trị mặc định của server.
+- Nút **Dò host sống** / **Hủy dò**, thanh tiến độ và thời gian chạy riêng.
+- Kết quả là **bảng danh sách host sống**, mỗi dòng có checkbox, kèm hai nút
+  **Chọn tất cả** / **Bỏ chọn tất cả** và dòng "Đã chọn N/M host sống". Mặc định
+  chọn hết các host vừa dò được.
+
+### Khối 2 — Quét cổng
+
+- Ô **Host cần quét** luôn có sẵn: một IP hoặc danh sách IP cách nhau bằng dấu phẩy
+  (`10.0.0.5,10.0.0.9`), dùng độc lập không cần qua bước dò. Không nhận CIDR.
+- Khi bảng dò có host, dòng "Đã chọn N/M host sống" và nút **Dùng host đã chọn**
+  xuất hiện: bấm nút này thì khối quét dùng đúng danh sách đang tick trong bảng
+  (gõ tay vào ô host sẽ quay lại chế độ nhập tay).
+- **Dải cổng** kèm ba chip `Phổ biến`, `1-1024`, `Web`; nhận tới `1-65535`.
+- **Tùy chọn nâng cao** (thu gọn): `timeout`, `banner_timeout`, `concurrency`.
 
   | Trường | Tham số API | Mặc định | Giới hạn server kiểm tra |
   | --- | --- | --- | --- |
@@ -411,31 +422,22 @@ Giao diện gồm:
 
   Để trống một trường nghĩa là dùng mặc định. Giao diện kiểm tra định dạng và khoảng
   để hỗ trợ nhập liệu, nhưng **server luôn kiểm tra lại** và là nơi quyết định.
-- **Quét** / **Hủy quét**; nhấn Enter trong ô nhập cũng bắt đầu quét. Trong lúc
-  chạy, các ô nhập, chip, tùy chọn nâng cao và nút Quét bị vô hiệu hóa, chỉ nút Hủy
-  còn bật.
-- **Cảnh báo quét lớn**: khi một trong hai giai đoạn vượt `500.000` lượt, hộp cảnh
-  báo nổi bật hiện ra, nêu rõ **giai đoạn nào** vượt (dò host hay quét cổng) kèm nút
-  **Xác nhận quét lớn và bắt đầu**. Nếu giai đoạn nào vượt trần cứng `5.000.000` lượt,
-  hộp cảnh báo nói rõ server sẽ từ chối và nút xác nhận không hiện.
-- **Vùng tiến độ** (`aria-live="polite"`) hiển thị giai đoạn (dò host sống / quét
-  cổng), lô đang chạy, số host đã xong, số cổng đã quét trên tổng số cổng của cả
-  job và thời gian đã trôi qua.
-- **Bảng kết quả** (host, cổng, dịch vụ, banner), sắp xếp theo địa chỉ IP bằng so
-  sánh số rồi theo cổng; banner rỗng hiện `—`, banner dài được cắt gọn và hiện đầy
-  đủ khi rê chuột. Bảng tự cập nhật sau mỗi lô, không chờ hết cả job. Nhãn "Kết quả
-  một phần" hiện khi còn lô chưa chạy, khi bị hủy hoặc khi lỗi. Dòng dưới tiêu đề
-  ghi lại đúng tham số của lần quét đã chạy (kể cả tùy chọn nâng cao khác mặc định),
-  không lấy từ ô nhập hiện tại.
-- Hai nút **tải JSON/CSV**, và giao diện tự chuyển màu theo chế độ tối của hệ điều
-  hành (`prefers-color-scheme`) và co giãn trên màn hình hẹp.
+- Dòng ước tính của khối này dùng **số host thật** đang chọn/nhập:
+  `Lượt quét cổng (số host thật): 2.048 (2 host × 1.024 cổng) · khoảng 20 giây`.
+- Nút **Quét** / **Hủy quét**, thanh tiến độ, **bảng kết quả** (host, cổng, dịch vụ,
+  banner) và hai nút tải **JSON/CSV** — giống khối kết quả trước đây.
+
+Hai khối chạy hoàn toàn độc lập: có thể quét cổng nhiều lần với các lựa chọn host
+khác nhau từ **cùng một lần dò**, không phải dò lại. Cảnh báo quét lớn hiện riêng
+trong từng khối và nêu rõ giai đoạn nào vượt mốc.
 
 Quét chạy ở thread nền; trang hỏi trạng thái định kỳ (polling, không dùng
-WebSocket). Lỗi trả về từ server (400/403/409...) được hiện thành câu tiếng Việt
-trên vùng trạng thái, không in JSON thô.
+WebSocket). Lỗi trả về từ server (400/403/409/413...) được hiện thành câu tiếng Việt
+trên vùng trạng thái của khối tương ứng, không in JSON thô.
 
-Kiểm tra IP và prefix ở phía giao diện chỉ để giúp nhập liệu nhanh; mọi giới hạn an
-toàn vẫn do server quyết định.
+Kiểm tra phía giao diện chỉ để giúp nhập liệu nhanh; mọi giới hạn an toàn vẫn do
+server quyết định. Trang không dùng `innerHTML` hay bất kỳ cách chèn HTML nào: mọi
+dữ liệu từ server (host, banner) đều vào DOM bằng `textContent`.
 
 ### Quét theo lô
 
@@ -554,12 +556,16 @@ curl.exe -s -X POST http://127.0.0.1:8000/api/scan `
 - `target` là nhãn hiển thị: một IP khi `hosts` có đúng một phần tử, ngược lại
   `"N host"`.
 
-Metadata trong file tải về gồm `target`, `hosts_count`, `port_range`,
-`total_open_ports`, `scan_duration_seconds`, `batches_completed` và `batches_total`.
+Metadata trong file tải về gồm `target` (nhãn), `target_hosts` (danh sách host thật),
+`hosts_count`, `port_range`, `total_open_ports`, `scan_duration_seconds`,
+`batches_completed` và `batches_total`.
 
 **Chạy đồng thời.** Mỗi loại job chỉ cho một job chạy tại một thời điểm: gọi
 `/api/scan` khi đang có job scan sẽ nhận `409`, tương tự với `/api/discover`.
 Hai loại **độc lập** nên một job discover và một job scan có thể chạy cùng lúc.
+
+Body JSON tối đa **1 MiB**, đủ cho danh sách host của một lần dò `/18` (tối đa
+16.382 host, khoảng 300 KB); lớn hơn thì trả `413`.
 
 Mã lỗi: `400` dữ liệu sai / vượt giới hạn, `403` thiếu token / Host hoặc Origin lạ /
 CIDR hoặc host ngoài dải nội bộ, `404` id không tồn tại hoặc sai loại job, `409`
