@@ -198,6 +198,8 @@
     margin-bottom: 12px;
   }
   .results-head .tools { display: flex; gap: 8px; flex-wrap: wrap; }
+  .results-title { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  #scan-params { margin: 0; }
 
   .badge {
     padding: 2px 8px;
@@ -286,7 +288,7 @@
           <div class="field prefix-field">
             <label for="prefix">CIDR, tùy chọn</label>
             <input id="prefix" name="prefix" type="number" min="24" max="32" step="1"
-                   placeholder="24" inputmode="numeric" autocomplete="off"
+                   placeholder="vd: 24" inputmode="numeric" autocomplete="off"
                    aria-describedby="ip-error cidr-preview">
           </div>
         </div>
@@ -312,10 +314,8 @@
       </div>
     </form>
     <p class="hint">
-      Ví dụ: IP <code>127.0.0.1</code> và để trống prefix (quét một máy), hoặc IP
-      <code>192.168.1.10</code> với prefix <code>24</code> (quét cả dải, được chuẩn hóa
-      thành <code>192.168.1.0/24</code>). Ví dụ dải cổng: <code>1-1024</code>,
-      <code>22,80,443</code>.
+      Để trống prefix để quét một máy; điền prefix để quét cả dải. Dải cổng ví dụ:
+      <code>1-1024</code> hoặc <code>22,80,443</code>.
     </p>
   </section>
 
@@ -332,11 +332,14 @@
 
   <section class="panel">
     <div class="results-head">
-      <h2>
-        Kết quả
-        <span id="count" class="hint"></span>
-        <span id="partial-label" class="badge" hidden>Kết quả một phần</span>
-      </h2>
+      <div class="results-title">
+        <h2>
+          Kết quả
+          <span id="count" class="hint"></span>
+          <span id="partial-label" class="badge" hidden>Kết quả một phần</span>
+        </h2>
+        <p id="scan-params" class="hint"></p>
+      </div>
       <div class="tools">
         <button id="dl-json" type="button" class="secondary" disabled>Tải JSON</button>
         <button id="dl-csv" type="button" class="secondary" disabled>Tải CSV</button>
@@ -567,6 +570,7 @@
     bar: document.getElementById("bar-fill"),
     alert: document.getElementById("alert"),
     count: document.getElementById("count"),
+    params: document.getElementById("scan-params"),
     partial: document.getElementById("partial-label"),
     tbody: document.getElementById("results-body"),
     dlJson: document.getElementById("dl-json"),
@@ -750,6 +754,12 @@
   // Tiến độ
   // ------------------------------------------------------------------
 
+  function currentHostTotal(job) {
+    // Trong giai đoạn quét cổng, tổng số host nằm ở đầu thông báo dạng "[1/2]".
+    var match = /^\[(\d+)\/(\d+)\]/.exec(job.message || "");
+    return match ? Number(match[2]) : null;
+  }
+
   function phaseCountText(job) {
     var progress = job.progress || {};
     var done = progress.done || 0;
@@ -758,7 +768,10 @@
       return "Đã dò " + done + "/" + total + " host";
     }
     if (job.phase === "scanning") {
-      return "Đã quét " + done + "/" + total + " cổng của host hiện tại";
+      // Chỉ ghi "của host hiện tại" khi lần quét thật sự có nhiều host.
+      var hostTotal = currentHostTotal(job);
+      var suffix = hostTotal !== null && hostTotal > 1 ? " của host hiện tại" : "";
+      return "Đã quét " + done + "/" + total + " cổng" + suffix;
     }
     return total > 0 ? done + "/" + total : "";
   }
@@ -774,6 +787,38 @@
       return "Host " + (progress.done || 0) + "/" + (progress.total || 0);
     }
     return "";
+  }
+
+  function detailMessage(job) {
+    // Thông báo của server đôi khi mở đầu bằng chính nhãn trạng thái
+    // ("Hoàn tất: 2 cổng mở."), nên bỏ phần lặp đó ở dòng chi tiết.
+    var message = (job.message || "").trim();
+    var label = STATUS_TEXT[job.status];
+    if (!label) {
+      return message;
+    }
+    var prefixes = [label + ":", label + " —", label + " –", label + " -"];
+    for (var i = 0; i < prefixes.length; i++) {
+      if (message.indexOf(prefixes[i]) === 0) {
+        return message.slice(prefixes[i].length).trim();
+      }
+    }
+    return message;
+  }
+
+  function scanParamsText(job) {
+    // Lấy từ job đã chạy, không lấy từ ô nhập hiện tại, để kết quả luôn khớp
+    // với tham số của lần quét đang hiển thị.
+    var target = job.target ? String(job.target) : "";
+    var ports = job.ports ? String(job.ports) : "";
+    var parts = [];
+    if (target) {
+      parts.push("Mục tiêu " + target);
+    }
+    if (ports) {
+      parts.push("Dải cổng " + ports);
+    }
+    return parts.join(" · ");
   }
 
   function renderJob(job) {
@@ -794,7 +839,8 @@
       }
     }
     els.phase.textContent = phaseLine.join(" · ");
-    els.message.textContent = job.message || "";
+    els.message.textContent = detailMessage(job);
+    els.params.textContent = scanParamsText(job);
 
     var errors = job.errors || [];
     if (errors.length > 0) {
@@ -941,6 +987,7 @@
     clearRows();
     renderEmptyRow("Đang gửi yêu cầu quét...");
     els.count.textContent = "";
+    els.params.textContent = "";
     els.partial.hidden = true;
     els.dlJson.disabled = true;
     els.dlCsv.disabled = true;
