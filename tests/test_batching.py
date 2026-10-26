@@ -164,7 +164,7 @@ class AttemptLimitTest(unittest.TestCase):
         self.assertIn("giai đoạn quét cổng", message)
         self.assertIn("16382 host", message)
         self.assertIn("giảm số cổng", message)
-        self.assertIn("thu nhỏ dải CIDR", message)
+        self.assertIn("bớt host", message)
 
     def test_slash_18_is_accepted_and_slash_17_is_not(self) -> None:
         self.assertEqual(str(parse_target("10.0.0.0/18")), "10.0.0.0/18")

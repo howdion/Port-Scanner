@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import ipaddress
+import json
 import math
 import sys
 import time
@@ -43,6 +44,18 @@ STAGE_LABELS = {
     STAGE_DISCOVERY: "giai đoạn dò host sống",
     STAGE_SCAN: "giai đoạn quét cổng",
 }
+
+# Hai subcommand của CLI. Hai giai đoạn chạy tách rời nên `scan` không tự dò CIDR.
+SUBCOMMANDS = ("discover", "scan")
+
+# Thông báo khi người dùng còn truyền CIDR thẳng vào `scan`.
+SCAN_CIDR_HINT = (
+    "scan không còn tự dò CIDR, hãy chạy 'main.py discover <CIDR>' trước rồi "
+    "dùng --hosts-file hoặc --hosts với danh sách host thu được."
+)
+
+# Khóa chứa danh sách host sống trong file JSON do `discover` tạo ra.
+LIVE_HOSTS_KEY = "live_hosts"
 
 
 def count_target_hosts(
@@ -101,7 +114,7 @@ def stage_limit_message(stage: str, hosts: int, ports_count: int) -> str:
     if stage == STAGE_DISCOVERY:
         hint = "Hãy giảm số cổng dò host hoặc thu nhỏ dải CIDR."
     else:
-        hint = "Hãy giảm số cổng hoặc thu nhỏ dải CIDR."
+        hint = "Hãy giảm số cổng hoặc bớt host trong danh sách cần quét."
     return (
         f"Vượt trần cứng {format_attempts(HARD_ATTEMPTS)} lượt ở "
         f"{STAGE_LABELS[stage]}: ước tính {format_attempts(attempts)} lượt "
@@ -317,6 +330,128 @@ def confirm_large_scan(
     return answer in {"y", "yes"}
 
 
+def enforce_stage_limits(
+    stage: str,
+    hosts: int,
+    ports_count: int,
+    timeout: float,
+    workers: int,
+    assume_confirm: bool,
+) -> bool:
+    """Kiểm tra hai mốc cho MỘT giai đoạn; trả False nếu phải dừng.
+
+    Số host truyền vào là số THẬT của giai đoạn đó: với `discover` là số host tối
+    đa của CIDR, với `scan` là số host có trong danh sách cần quét.
+    """
+    if hosts <= 0 or ports_count <= 0:
+        return True
+
+    attempts = estimate_stage_attempts(hosts, ports_count)
+    if attempts > HARD_ATTEMPTS:
+        print(f"LỖI: {stage_limit_message(stage, hosts, ports_count)}")
+        return False
+
+    if attempts > WARN_ATTEMPTS:
+        seconds = estimate_stage_seconds(hosts, ports_count, timeout, workers)
+        if not confirm_large_scan(
+            stage, attempts, seconds, assume_confirm=assume_confirm
+        ):
+            print("Đã hủy.")
+            return False
+    return True
+
+
+def parse_host(value: str) -> ipaddress.IPv4Address:
+    """Kiểm tra một host là IPv4 hợp lệ và thuộc dải nội bộ.
+
+    Khác với mục tiêu của `scan` (vẫn cảnh báo rồi hỏi xác nhận như trước), host
+    trong danh sách bị từ chối hẳn nếu nằm ngoài dải nội bộ.
+
+    Raises:
+        ValueError: Khi host rỗng, là CIDR, không phải IPv4, hoặc ngoài dải nội bộ.
+    """
+    text = value.strip()
+    if not text:
+        raise ValueError("địa chỉ host không được để trống")
+    if "/" in text:
+        raise ValueError(
+            f"danh sách host chỉ nhận từng địa chỉ IPv4, không nhận CIDR: {text!r}"
+        )
+
+    try:
+        ip = ipaddress.ip_address(text)
+    except ValueError as exc:
+        raise ValueError(f"địa chỉ IPv4 không hợp lệ: {text!r}") from exc
+
+    if ip.version != 4:
+        raise ValueError("hiện chỉ hỗ trợ địa chỉ IPv4")
+    if not is_internal(ip):
+        raise ValueError(
+            f"host ngoài dải nội bộ bị từ chối: {ip} "
+            "(chỉ nhận 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8)"
+        )
+    return ip
+
+
+def parse_host_list(value: str) -> list[ipaddress.IPv4Address]:
+    """Phân tích --hosts: danh sách IPv4 phân cách bằng dấu phẩy, loại trùng.
+
+    Raises:
+        ValueError: Khi có phần tử rỗng hoặc có host không hợp lệ.
+    """
+    hosts: list[ipaddress.IPv4Address] = []
+    for part in value.split(","):
+        if not part.strip():
+            raise ValueError("danh sách host không được để trống")
+        hosts.append(parse_host(part))
+    return list(dict.fromkeys(hosts))
+
+
+def load_hosts_file(path_value: str) -> tuple[list[ipaddress.IPv4Address], str]:
+    """Đọc danh sách host từ file JSON do `discover` tạo ra.
+
+    Returns:
+        Cặp (danh sách host, CIDR gốc nếu file có ghi).
+
+    Raises:
+        ValueError: Khi không đọc được file, JSON sai, hoặc host không hợp lệ.
+    """
+    path = Path(path_value)
+    try:
+        # utf-8-sig để đọc được cả file có BOM do Notepad trên Windows tạo ra.
+        raw = path.read_text(encoding="utf-8-sig")
+    except OSError as exc:
+        raise ValueError(f"không đọc được file host {path}: {exc}") from exc
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"file host {path} không phải JSON hợp lệ: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError(f"file host {path} phải là một đối tượng JSON")
+
+    entries = data.get(LIVE_HOSTS_KEY)
+    if not isinstance(entries, list) or not entries:
+        raise ValueError(
+            f"file host {path} thiếu danh sách '{LIVE_HOSTS_KEY}' không rỗng"
+        )
+
+    hosts: list[ipaddress.IPv4Address] = []
+    for entry in entries:
+        if not isinstance(entry, str):
+            raise ValueError(
+                f"file host {path}: mỗi host phải là chuỗi, gặp {type(entry).__name__}"
+            )
+        try:
+            hosts.append(parse_host(entry))
+        except ValueError as exc:
+            raise ValueError(f"file host {path}: {exc}") from exc
+
+    cidr = data.get("cidr")
+    return list(dict.fromkeys(hosts)), cidr.strip() if isinstance(cidr, str) else ""
+
+
 def format_port_line(port: int, banner: str | None) -> str:
     """Định dạng một dòng kết quả cổng kèm tên dịch vụ và banner."""
     line = f"  {port}/tcp  {get_service_name(port)}"
@@ -383,9 +518,49 @@ def resolve_output_path(value: str) -> Path:
     return path
 
 
+def prepare_output_path(args: argparse.Namespace, kind: str) -> Path | None:
+    """Chuẩn hóa đường dẫn --output và xử lý ghi đè.
+
+    Trả về đường dẫn cần ghi, hoặc None khi đã in lỗi/người dùng từ chối ghi đè.
+    """
+    try:
+        path = resolve_output_path(args.output)
+    except ValueError as exc:
+        print(f"Lỗi: {exc}")
+        return None
+
+    if not path.exists():
+        return path
+
+    if path.is_dir():
+        print(f"Lỗi: đường dẫn {kind} là thư mục: {path}")
+        return None
+
+    if getattr(args, "force", False):
+        print(f"Ghi đè {kind} (--force): {path}")
+        return path
+
+    print(f"File {kind} đã tồn tại: {path}")
+    if not stdin_is_interactive():
+        print("Cần --force khi chạy không tương tác để ghi đè.")
+        return None
+    try:
+        answer = input("Ghi đè? [y/N]: ").strip().lower()
+    except EOFError:
+        print("\nKhông nhận được xác nhận; cần --force để ghi đè.")
+        return None
+    except (KeyboardInterrupt, OSError):
+        print(f"\nĐã hủy ghi {kind}.")
+        return None
+    if answer not in {"y", "yes"}:
+        print(f"Không ghi đè; {kind} không được tạo.")
+        return None
+    return path
+
+
 def save_report_if_requested(
     args: argparse.Namespace,
-    target: ipaddress.IPv4Address | ipaddress.IPv4Network,
+    target: ipaddress.IPv4Address | ipaddress.IPv4Network | str,
     ports: list[int],
     records: list[ScanRecord],
     duration: float,
@@ -394,34 +569,9 @@ def save_report_if_requested(
     if not args.output:
         return 0
 
-    try:
-        path = resolve_output_path(args.output)
-    except ValueError as exc:
-        print(f"Lỗi: {exc}")
+    path = prepare_output_path(args, "báo cáo")
+    if path is None:
         return 1
-
-    if path.exists():
-        if path.is_dir():
-            print(f"Lỗi: đường dẫn báo cáo là thư mục: {path}")
-            return 1
-        if not args.force:
-            print(f"File báo cáo đã tồn tại: {path}")
-            if not stdin_is_interactive():
-                print("Cần --force khi chạy không tương tác để ghi đè.")
-                return 1
-            try:
-                answer = input("Ghi đè? [y/N]: ").strip().lower()
-            except EOFError:
-                print("\nKhông nhận được xác nhận; cần --force để ghi đè.")
-                return 1
-            except (KeyboardInterrupt, OSError):
-                print("\nĐã hủy ghi báo cáo.")
-                return 1
-            if answer not in {"y", "yes"}:
-                print("Không ghi đè; báo cáo không được tạo.")
-                return 1
-        else:
-            print(f"Ghi đè báo cáo (--force): {path}")
 
     metadata = {
         "target": str(target),
@@ -440,82 +590,186 @@ def save_report_if_requested(
     return 0
 
 
-def scan_network(
-    network: ipaddress.IPv4Network,
+def write_discovery_output(
     args: argparse.Namespace,
+    network: ipaddress.IPv4Network,
+    discovery_ports: tuple[int, ...],
+    live_hosts: list[str],
 ) -> int:
-    """Dò host sống rồi quét cổng từng host trong dải CIDR."""
-    hosts = [str(host) for host in network.hosts()]
+    """Ghi JSON kết quả dò host nếu có --output; 0 nếu thành công hoặc không ghi."""
+    if not args.output:
+        return 0
+
+    path = prepare_output_path(args, "kết quả dò host")
+    if path is None:
+        return 1
+
+    payload = {
+        "cidr": str(network),
+        "discovery_ports": format_port_spec(list(discovery_ports)),
+        "discovered_at": current_timestamp(),
+        "live_hosts": list(live_hosts),
+    }
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        print(f"Lỗi: không thể ghi {path}: {exc}")
+        return 1
+
+    print(f"Đã ghi danh sách host sống: {path}")
     print(
-        f"Đang kiểm tra host sống trong {network} "
-        f"({len(hosts)} host, cổng dò {format_port_spec(args.discovery_ports)}, "
-        f"timeout {args.discovery_timeout}s)..."
+        "Dùng lại bằng: main.py scan --hosts-file "
+        f"{path} --ports <dải cổng>"
+    )
+    return 0
+
+
+def run_discover(args: argparse.Namespace) -> int:
+    """Giai đoạn 1: chỉ dò host sống trong CIDR, KHÔNG quét cổng."""
+    network: ipaddress.IPv4Network = args.cidr
+    hosts = [str(host) for host in network.hosts()]
+    discovery_ports = tuple(args.discovery_ports)
+
+    # Giới hạn của riêng giai đoạn dò: số host tối đa × số cổng dò.
+    if not enforce_stage_limits(
+        STAGE_DISCOVERY,
+        len(hosts),
+        len(discovery_ports),
+        args.discovery_timeout,
+        args.concurrency,
+        args.confirm_large_scan,
+    ):
+        return 1
+
+    print(
+        f"Đang dò host sống trong {network} "
+        f"({len(hosts)} host, cổng dò {format_port_spec(list(discovery_ports))}, "
+        f"timeout {args.discovery_timeout}s, {args.concurrency} luồng)..."
     )
 
     def report_progress(done: int, total: int, host: str, is_alive: bool) -> None:
         status = "sống" if is_alive else "không phản hồi"
         print(f"[{done}/{total}] {host}: {status}")
 
-    records: list[ScanRecord] = []
-    report_started = time.perf_counter()
+    started = time.perf_counter()
     try:
-        alive_hosts = discover_hosts(
+        live_hosts = discover_hosts(
             hosts,
-            ports=tuple(args.discovery_ports),
+            ports=discovery_ports,
             timeout=args.discovery_timeout,
-            workers=args.workers,
+            workers=args.concurrency,
             on_progress=report_progress,
         )
     except KeyboardInterrupt:
         print("\nĐã hủy bởi người dùng.")
         return 130
-    elapsed = time.perf_counter() - report_started
+    elapsed = time.perf_counter() - started
 
     print(
-        f"\nTìm thấy {len(alive_hosts)}/{len(hosts)} host sống "
+        f"\nTìm thấy {len(live_hosts)}/{len(hosts)} host sống "
         f"trong {elapsed:.2f} giây."
     )
-    if not alive_hosts:
-        print("Không có host nào phản hồi; bỏ qua quét cổng.")
-        total_elapsed = time.perf_counter() - report_started
-        report_status = save_report_if_requested(
-            args, network, args.ports, records, total_elapsed
-        )
-        return 1 if report_status != 0 else 0
+    if live_hosts:
+        print("Danh sách host sống:")
+        for host in live_hosts:
+            print(f"  {host}")
+    else:
+        print("Không có host nào phản hồi.")
 
-    # Kiểm tra thật giai đoạn quét cổng bằng số host sống thực tế. Đây là phép
-    # so sánh ĐỘC LẬP của giai đoạn quét, không cộng lượt dò host đã chạy.
-    alive_attempts = estimate_stage_attempts(len(alive_hosts), len(args.ports))
-    if alive_attempts > HARD_ATTEMPTS:
-        print(
-            "LỖI: sau khi dò host sống, "
-            f"{stage_limit_message(STAGE_SCAN, len(alive_hosts), len(args.ports))}"
+    status = write_discovery_output(args, network, discovery_ports, live_hosts)
+    return 1 if status != 0 else 0
+
+
+def scan_one_host(host: ipaddress.IPv4Address, args: argparse.Namespace) -> int:
+    """Giai đoạn 2 với đúng một host: giữ nguyên hành vi quét một IP như trước."""
+    target = str(host)
+    ports = args.ports
+    print(
+        f"Đang quét {target} với {len(ports)} cổng "
+        f"(timeout {args.timeout}s, banner {args.banner_timeout}s, "
+        f"{args.workers} luồng)..."
+    )
+    started = time.perf_counter()
+    try:
+        open_ports, errors = scan_ports(
+            target,
+            ports,
+            timeout=args.timeout,
+            workers=args.workers,
         )
+        banners = grab_banners(
+            target,
+            open_ports,
+            timeout=args.banner_timeout,
+            workers=args.workers,
+        )
+    except KeyboardInterrupt:
+        print("\nĐã hủy bởi người dùng.")
+        return 130
+    elapsed = time.perf_counter() - started
+    scanned_at = current_timestamp()
+    records = build_records(target, open_ports, banners, scanned_at)
+
+    if errors:
+        print(f"\nCảnh báo: {len(errors)} cổng gặp lỗi mạng, ví dụ:")
+        for port, message in errors[:5]:
+            print(f"  {port}/tcp: {message}")
+
+    print()
+    if open_ports:
+        print(f"Cổng mở trên {target}:")
+        for port in open_ports:
+            print(format_port_line(port, banners.get(port)))
+    else:
+        print(f"Không tìm thấy cổng mở trên {target}.")
+
+    print(f"\nHoàn tất: {len(open_ports)} cổng mở trong {elapsed:.2f} giây.")
+
+    report_status = save_report_if_requested(
+        args, target, ports, records, elapsed
+    )
+
+    if errors and not open_ports:
+        print("Kiểm tra kết nối mạng hoặc thử tăng --timeout.")
         return 1
-    if alive_attempts > WARN_ATTEMPTS and not args.confirm_large_scan:
-        alive_seconds = estimate_stage_seconds(
-            len(alive_hosts), len(args.ports), args.timeout, args.workers
-        )
-        if not confirm_large_scan(STAGE_SCAN, alive_attempts, alive_seconds):
-            print("Đã hủy quét.")
-            return 1
+    return 0 if report_status == 0 else 1
 
+
+def scan_host_list(
+    hosts: list[ipaddress.IPv4Address],
+    label: str,
+    args: argparse.Namespace,
+) -> int:
+    """Giai đoạn 2 với danh sách host đã biết; KHÔNG dò host sống."""
+    ports = args.ports
+    print(
+        f"Đang quét {len(hosts)} host với {len(ports)} cổng "
+        f"(timeout {args.timeout}s, banner {args.banner_timeout}s, "
+        f"{args.workers} luồng)..."
+    )
+
+    records: list[ScanRecord] = []
     total_open_ports = 0
-    for index, host in enumerate(alive_hosts, start=1):
-        print(
-            f"\n[{index}/{len(alive_hosts)}] Đang quét {host} "
-            f"({len(args.ports)} cổng)..."
-        )
+    started = time.perf_counter()
+
+    for index, host in enumerate(hosts, start=1):
+        host_text = str(host)
+        print(f"\n[{index}/{len(hosts)}] Đang quét {host_text} ({len(ports)} cổng)...")
         host_started = time.perf_counter()
         try:
             open_ports, errors = scan_ports(
-                host,
-                args.ports,
+                host_text,
+                ports,
                 timeout=args.timeout,
                 workers=args.workers,
             )
             banners = grab_banners(
-                host,
+                host_text,
                 open_ports,
                 timeout=args.banner_timeout,
                 workers=args.workers,
@@ -525,7 +779,7 @@ def scan_network(
             return 130
         host_elapsed = time.perf_counter() - host_started
         scanned_at = current_timestamp()
-        records.extend(build_records(host, open_ports, banners, scanned_at))
+        records.extend(build_records(host_text, open_ports, banners, scanned_at))
 
         if errors:
             print(f"Cảnh báo: {len(errors)} cổng gặp lỗi mạng, ví dụ:")
@@ -533,48 +787,194 @@ def scan_network(
                 print(f"  {port}/tcp: {message}")
 
         if open_ports:
-            print(f"Cổng mở trên {host}:")
+            print(f"Cổng mở trên {host_text}:")
             for port in open_ports:
                 print(format_port_line(port, banners.get(port)))
             total_open_ports += len(open_ports)
         else:
-            print(f"Không tìm thấy cổng mở trên {host}.")
+            print(f"Không tìm thấy cổng mở trên {host_text}.")
 
         print(
-            f"Hoàn tất host {host}: {len(open_ports)} cổng mở "
+            f"Hoàn tất host {host_text}: {len(open_ports)} cổng mở "
             f"trong {host_elapsed:.2f} giây."
         )
 
-    print(
-        f"\nTổng cộng: {len(alive_hosts)} host sống, "
-        f"{total_open_ports} cổng mở."
-    )
+    elapsed = time.perf_counter() - started
+    print(f"\nTổng cộng: {len(hosts)} host, {total_open_ports} cổng mở.")
 
-    total_elapsed = time.perf_counter() - report_started
-    report_status = save_report_if_requested(
-        args, network, args.ports, records, total_elapsed
-    )
-    return 1 if report_status != 0 else 0
+    report_status = save_report_if_requested(args, label, ports, records, elapsed)
+    return 0 if report_status == 0 else 1
 
 
-def build_parser() -> argparse.ArgumentParser:
-    """Tạo bộ phân tích tham số dòng lệnh."""
-    parser = argparse.ArgumentParser(
+def run_scan(
+    hosts: list[ipaddress.IPv4Address],
+    label: str,
+    args: argparse.Namespace,
+) -> int:
+    """Giai đoạn 2: kiểm tra giới hạn bằng số host THẬT rồi quét cổng."""
+    if not enforce_stage_limits(
+        STAGE_SCAN,
+        len(hosts),
+        len(args.ports),
+        args.timeout,
+        args.workers,
+        args.confirm_large_scan,
+    ):
+        return 1
+
+    if len(hosts) == 1:
+        return scan_one_host(hosts[0], args)
+    return scan_host_list(hosts, label, args)
+
+
+def resolve_scan_targets(
+    args: argparse.Namespace,
+) -> tuple[list[ipaddress.IPv4Address], str] | None:
+    """Xác định danh sách host của `scan`; None khi tham số không hợp lệ."""
+    provided = [
+        args.target is not None,
+        args.hosts is not None,
+        args.hosts_file is not None,
+    ]
+    if sum(provided) == 0:
+        print(
+            "Lỗi: cần một mục tiêu: một IP đơn, hoặc --hosts <ip1,ip2,...>, "
+            "hoặc --hosts-file <file JSON do 'main.py discover' tạo ra>."
+        )
+        return None
+    if sum(provided) > 1:
+        print(
+            "Lỗi: chỉ được dùng một nguồn host: mục tiêu IP, --hosts "
+            "hoặc --hosts-file."
+        )
+        return None
+
+    if args.target is not None:
+        text = args.target.strip()
+        if "/" in text:
+            print(f"Lỗi: {SCAN_CIDR_HINT}")
+            return None
+        try:
+            ip = parse_target(text)
+        except argparse.ArgumentTypeError as exc:
+            print(f"Lỗi: {exc}")
+            return None
+        if isinstance(ip, ipaddress.IPv4Network):
+            print(f"Lỗi: {SCAN_CIDR_HINT}")
+            return None
+        if not is_internal(ip) and not confirm_external_target(
+            ip, assume_yes=args.yes
+        ):
+            print("Đã hủy quét.")
+            return None
+        return [ip], str(ip)
+
+    if args.hosts is not None:
+        try:
+            hosts = parse_host_list(args.hosts)
+        except ValueError as exc:
+            print(f"Lỗi: --hosts: {exc}")
+            return None
+        return hosts, f"{len(hosts)} host từ --hosts"
+
+    try:
+        hosts, cidr = load_hosts_file(args.hosts_file)
+    except ValueError as exc:
+        print(f"Lỗi: {exc}")
+        return None
+    label = cidr or f"{len(hosts)} host từ {args.hosts_file}"
+    return hosts, label
+
+
+def add_discover_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Thêm subcommand `discover`: chỉ dò host sống trong CIDR."""
+    parser = subparsers.add_parser(
+        "discover",
+        help="dò host sống trong một dải CIDR (không quét cổng)",
         description=(
-            f"Quét cổng TCP bằng TCP connect (IPv4 hoặc CIDR từ "
-            f"/{CIDR_MIN_PREFIX} đến /32)."
+            "Giai đoạn 1: dò host sống trong một dải CIDR rồi in danh sách thu "
+            "được. Không quét cổng. Dùng danh sách đó cho 'scan' ở bước sau."
         ),
     )
     parser.add_argument(
+        "cidr",
+        type=parse_target,
+        metavar="CIDR",
+        help=f"dải CIDR từ /{CIDR_MIN_PREFIX} đến /32, ví dụ 192.168.1.0/24",
+    )
+    parser.add_argument(
+        "--discovery-ports",
+        default="22,80,135,443,445",
+        type=parse_ports,
+        metavar="PORTS",
+        help="cổng dùng để dò host sống (mặc định: 22,80,135,443,445)",
+    )
+    parser.add_argument(
+        "--discovery-timeout",
+        default=0.3,
+        type=positive_float,
+        metavar="GIÂY",
+        help="thời gian chờ mỗi lần thử khi dò host sống (mặc định: 0.3)",
+    )
+    parser.add_argument(
+        "--concurrency",
+        default=100,
+        type=positive_int,
+        metavar="N",
+        help="số luồng dò song song (mặc định: 100)",
+    )
+    parser.add_argument(
+        "--output",
+        metavar="FILE",
+        help=(
+            "ghi danh sách host sống ra JSON để dùng lại với "
+            "'scan --hosts-file'; nếu chỉ ghi tên file thì đặt trong reports/"
+        ),
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="ghi đè file kết quả đã tồn tại mà không hỏi",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="tự xác nhận dò mục tiêu ngoài dải nội bộ",
+    )
+    parser.add_argument(
+        "--confirm-large-scan",
+        action="store_true",
+        help=(
+            "tự xác nhận khi giai đoạn dò vượt mốc "
+            f"{format_attempts(WARN_ATTEMPTS)} lượt"
+        ),
+    )
+
+
+def add_scan_arguments(
+    parser: argparse.ArgumentParser,
+    target_default: str | None = None,
+) -> None:
+    """Thêm tham số của giai đoạn quét cổng (dùng chung cho `scan` và lệnh cũ)."""
+    parser.add_argument(
         "target",
         nargs="?",
-        default=ipaddress.ip_address("127.0.0.1"),
-        type=parse_target,
-        metavar="IP/CIDR",
+        default=target_default,
+        metavar="IP",
+        help="một địa chỉ IPv4 đơn (không nhận CIDR; hãy chạy 'discover' trước)",
+    )
+    parser.add_argument(
+        "--hosts",
+        metavar="IP1,IP2,...",
         help=(
-            f"địa chỉ IPv4 hoặc dải CIDR từ /{CIDR_MIN_PREFIX} đến /32 "
-            "(mặc định: 127.0.0.1)"
+            "danh sách host phân cách bằng dấu phẩy, "
+            "ví dụ 192.168.1.5,192.168.1.9"
         ),
+    )
+    parser.add_argument(
+        "--hosts-file",
+        metavar="FILE",
+        help="file JSON do 'main.py discover --output' tạo ra",
     )
     parser.add_argument(
         "--ports",
@@ -601,20 +1001,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="thời gian chờ đọc banner cho mỗi cổng mở (mặc định: 0.5)",
     )
     parser.add_argument(
-        "--discovery-timeout",
-        default=0.3,
-        type=positive_float,
-        metavar="GIÂY",
-        help="thời gian chờ dò host sống trong CIDR (mặc định: 0.3)",
-    )
-    parser.add_argument(
-        "--discovery-ports",
-        default="22,80,135,443,445",
-        type=parse_ports,
-        metavar="PORTS",
-        help="cổng dùng để dò host sống (mặc định: 22,80,135,443,445)",
-    )
-    parser.add_argument(
         "--workers",
         default=100,
         type=positive_int,
@@ -635,7 +1021,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--confirm-large-scan",
         action="store_true",
         help=(
-            "tự xác nhận khi lần quét vượt mốc "
+            "tự xác nhận khi giai đoạn quét vượt mốc "
             f"{format_attempts(WARN_ATTEMPTS)} lượt"
         ),
     )
@@ -651,111 +1037,98 @@ def build_parser() -> argparse.ArgumentParser:
         default="json",
         help="định dạng báo cáo khi có --output (mặc định: json)",
     )
+
+
+def add_scan_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Thêm subcommand `scan`: quét cổng trên host đã biết, không dò CIDR."""
+    parser = subparsers.add_parser(
+        "scan",
+        help="quét cổng trên một IP đơn hoặc danh sách host đã biết",
+        description=(
+            "Giai đoạn 2: quét cổng trên một IP đơn, trên --hosts, hoặc trên "
+            "danh sách host do 'discover' tạo ra. Không tự dò host sống."
+        ),
+    )
+    add_scan_arguments(parser)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Tạo bộ phân tích tham số có hai subcommand discover và scan."""
+    parser = argparse.ArgumentParser(
+        prog="main.py",
+        description=(
+            "Quét cổng TCP bằng TCP connect. Hai giai đoạn tách rời: 'discover' "
+            "dò host sống trong CIDR, 'scan' quét cổng trên danh sách host đã "
+            "biết hoặc một IP đơn."
+        ),
+    )
+    subparsers = parser.add_subparsers(dest="command", metavar="{discover,scan}")
+    subparsers.required = True
+    add_discover_parser(subparsers)
+    add_scan_parser(subparsers)
     return parser
+
+
+def build_legacy_parser() -> argparse.ArgumentParser:
+    """Bộ phân tích kiểu cũ: 'main.py <IP> --ports ...' tương đương 'scan'."""
+    parser = argparse.ArgumentParser(
+        prog="main.py",
+        description=(
+            "Cách dùng cũ, tương đương 'main.py scan': quét cổng trên một IP "
+            "đơn. Muốn quét theo CIDR, hãy chạy 'main.py discover <CIDR>' trước "
+            "rồi dùng --hosts-file hoặc --hosts."
+        ),
+    )
+    # Không có subcommand thì mục tiêu mặc định vẫn là 127.0.0.1 như trước.
+    add_scan_arguments(parser, target_default="127.0.0.1")
+    return parser
+
+
+def handle_discover(args: argparse.Namespace) -> int:
+    """Xử lý subcommand discover."""
+    cidr = args.cidr
+    if not isinstance(cidr, ipaddress.IPv4Network):
+        print(
+            f"Lỗi: discover cần một dải CIDR từ /{CIDR_MIN_PREFIX} đến /32, "
+            f"không nhận một IP đơn (đã nhận {cidr})."
+        )
+        return 1
+    if not is_internal(cidr) and not confirm_external_target(
+        cidr, assume_yes=args.yes
+    ):
+        print("Đã hủy dò host.")
+        return 1
+    return run_discover(args)
+
+
+def handle_scan(args: argparse.Namespace) -> int:
+    """Xử lý subcommand scan (và cả cách gọi cũ không có subcommand)."""
+    resolved = resolve_scan_targets(args)
+    if resolved is None:
+        return 1
+    hosts, label = resolved
+    return run_scan(hosts, label, args)
 
 
 def main() -> int:
     """Chạy chương trình và trả về mã thoát."""
     configure_output_encoding()
-    args = build_parser().parse_args()
-    target: ipaddress.IPv4Address | ipaddress.IPv4Network = args.target
+    argv = sys.argv[1:]
+    first = argv[0] if argv else None
 
-    if not is_internal(target) and not confirm_external_target(
-        target, assume_yes=args.yes
-    ):
-        print("Đã hủy quét.")
-        return 1
+    if first in SUBCOMMANDS:
+        args = build_parser().parse_args(argv)
+        if args.command == "discover":
+            return handle_discover(args)
+        return handle_scan(args)
 
-    # Đánh giá TỪNG giai đoạn độc lập trước khi mở bất kỳ kết nối nào. Giai đoạn
-    # dò host chỉ có khi mục tiêu là CIDR; mục tiêu một IP chỉ có giai đoạn quét.
-    is_network = isinstance(target, ipaddress.IPv4Network)
-    max_hosts = count_target_hosts(target)
+    if first in {"-h", "--help"}:
+        build_parser().print_help()
+        return 0
 
-    stage_runs: list[tuple[str, int, int, float]] = []
-    if is_network:
-        stage_runs.append(
-            (
-                STAGE_DISCOVERY,
-                max_hosts,
-                len(args.discovery_ports),
-                args.discovery_timeout,
-            )
-        )
-    stage_runs.append((STAGE_SCAN, max_hosts, len(args.ports), args.timeout))
-
-    # Trần cứng được kiểm tra trước cho mọi giai đoạn: giai đoạn nào vượt thì
-    # dừng ngay và nêu rõ giai đoạn đó, không tốn thời gian hỏi xác nhận.
-    for stage, hosts, count, _stage_timeout in stage_runs:
-        if estimate_stage_attempts(hosts, count) > HARD_ATTEMPTS:
-            print(f"LỖI: {stage_limit_message(stage, hosts, count)}")
-            return 1
-
-    # Mốc cảnh báo: hỏi xác nhận riêng cho từng giai đoạn vượt mốc.
-    for stage, hosts, count, stage_timeout in stage_runs:
-        attempts = estimate_stage_attempts(hosts, count)
-        if attempts <= WARN_ATTEMPTS:
-            continue
-        seconds = estimate_stage_seconds(
-            hosts, count, stage_timeout, args.workers
-        )
-        if not confirm_large_scan(
-            stage, attempts, seconds, assume_confirm=args.confirm_large_scan
-        ):
-            print("Đã hủy quét.")
-            return 1
-
-    if is_network:
-        return scan_network(target, args)
-
-    print(
-        f"Đang quét {target} với {len(args.ports)} cổng "
-        f"(timeout {args.timeout}s, banner {args.banner_timeout}s, "
-        f"{args.workers} luồng)..."
-    )
-    started = time.perf_counter()
-    try:
-        open_ports, errors = scan_ports(
-            str(target),
-            args.ports,
-            timeout=args.timeout,
-            workers=args.workers,
-        )
-        banners = grab_banners(
-            str(target),
-            open_ports,
-            timeout=args.banner_timeout,
-            workers=args.workers,
-        )
-    except KeyboardInterrupt:
-        print("\nĐã hủy bởi người dùng.")
-        return 130
-    elapsed = time.perf_counter() - started
-    scanned_at = current_timestamp()
-    records = build_records(str(target), open_ports, banners, scanned_at)
-
-    if errors:
-        print(f"\nCảnh báo: {len(errors)} cổng gặp lỗi mạng, ví dụ:")
-        for port, message in errors[:5]:
-            print(f"  {port}/tcp: {message}")
-
-    print()
-    if open_ports:
-        print(f"Cổng mở trên {target}:")
-        for port in open_ports:
-            print(format_port_line(port, banners.get(port)))
-    else:
-        print(f"Không tìm thấy cổng mở trên {target}.")
-
-    print(f"\nHoàn tất: {len(open_ports)} cổng mở trong {elapsed:.2f} giây.")
-
-    report_status = save_report_if_requested(
-        args, target, args.ports, records, elapsed
-    )
-
-    if errors and not open_ports:
-        print("Kiểm tra kết nối mạng hoặc thử tăng --timeout.")
-        return 1
-    return 0 if report_status == 0 else 1
+    # Tương thích ngược: không có subcommand là cách gọi cũ cho một IP đơn
+    # (chạy không tham số vẫn quét 127.0.0.1 như trước).
+    return handle_scan(build_legacy_parser().parse_args(argv))
 
 
 if __name__ == "__main__":

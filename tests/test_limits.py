@@ -201,13 +201,13 @@ class MessageTest(unittest.TestCase):
     """Thông báo phải nêu rõ giai đoạn nào vượt và cách giảm."""
 
     def test_scan_stage_message(self) -> None:
-        message = stage_limit_message(STAGE_SCAN, 16382, 1024)
+        message = stage_limit_message(STAGE_SCAN, 100, 65535)
         self.assertIn("5.000.000", message)
         self.assertIn("giai đoạn quét cổng", message)
-        self.assertIn("16.775.168", message)
-        self.assertIn("16382 host", message)
+        self.assertIn("6.553.500", message)
+        self.assertIn("100 host", message)
         self.assertIn("giảm số cổng", message)
-        self.assertIn("thu nhỏ dải CIDR", message)
+        self.assertIn("bớt host", message)
 
     def test_discovery_stage_message(self) -> None:
         message = stage_limit_message(STAGE_DISCOVERY, 16382, 64)
@@ -226,77 +226,91 @@ class MessageTest(unittest.TestCase):
 
 
 class CliStageSeparationTest(unittest.TestCase):
-    """CLI kiểm tra hai giai đoạn độc lập trước khi mở bất kỳ kết nối nào."""
+    """Mỗi subcommand tự kiểm tra giới hạn bằng số host THẬT của nó."""
 
-    def test_image_case_rejects_scan_stage_before_discovery(self) -> None:
-        # 127.0.0.0/18, cổng 1-1024, 5 cổng dò, hai mốc đều 500.000:
-        # dò host 81.910 lượt (được phép), quét cổng 16.775.168 lượt (từ chối).
+    def invoke(self, argv: list[str]):
+        """Chạy CLI với mock mạng; trả về (mã thoát, stdout, mock dò, mock quét)."""
         output = io.StringIO()
-        with mock.patch.object(
-            sys, "argv", ["main.py", "127.0.0.0/18", "--ports", "1-1024"]
-        ), mock.patch.object(main, "HARD_ATTEMPTS", 500_000), mock.patch.object(
-            main, "WARN_ATTEMPTS", 500_000
-        ), mock.patch.object(
-            main, "discover_hosts"
-        ) as discover, mock.patch.object(
-            main, "scan_ports"
-        ) as scan, contextlib.redirect_stdout(output):
+        discover = mock.Mock(return_value=[])
+        scan = mock.Mock(return_value=([], []))
+        with mock.patch.object(sys, "argv", ["main.py", *argv]), \
+                mock.patch.object(main, "discover_hosts", discover), \
+                mock.patch.object(main, "scan_ports", scan), \
+                mock.patch.object(main, "grab_banners", return_value={}), \
+                mock.patch.object(main, "stdin_is_interactive", return_value=False), \
+                contextlib.redirect_stdout(output):
             code = main.main()
+        return code, output.getvalue(), discover, scan
 
-        text = output.getvalue()
+    def test_discover_hard_cap_uses_max_hosts(self) -> None:
+        # 16.382 host × 1.000 cổng dò = 16.382.000 > 5.000.000.
+        code, text, discover, _ = self.invoke(
+            ["discover", "127.0.0.0/18", "--discovery-ports", "1-1000"]
+        )
+
         self.assertEqual(code, 1)
-        self.assertIn("giai đoạn quét cổng", text)
-        self.assertIn("16.775.168", text)
-        self.assertIn("500.000", text)
-        self.assertNotIn(STAGE_LABELS[STAGE_DISCOVERY], text)
+        self.assertIn(STAGE_LABELS[STAGE_DISCOVERY], text)
+        self.assertIn("16.382.000", text)
         discover.assert_not_called()
-        scan.assert_not_called()
 
-    def test_single_ip_has_only_the_scan_stage(self) -> None:
-        output = io.StringIO()
-        with mock.patch.object(
-            sys, "argv", ["main.py", "127.0.0.1", "--ports", "1-1024"]
-        ), mock.patch.object(
-            main, "discover_hosts"
-        ) as discover, mock.patch.object(
-            main, "scan_ports", return_value=([], [])
-        ) as scan, mock.patch.object(
-            main, "grab_banners", return_value={}
-        ), contextlib.redirect_stdout(output):
-            code = main.main()
-
-        self.assertEqual(code, 0)
-        self.assertNotIn(STAGE_LABELS[STAGE_DISCOVERY], output.getvalue())
-        discover.assert_not_called()
-        scan.assert_called_once()
-
-    def test_discovery_stage_warning_uses_confirm_flag(self) -> None:
-        # 16.382 × 64 = 1.048.448 lượt dò: vượt cảnh báo; --confirm-large-scan
-        # cho phép chạy tiếp, sau đó tới phần quét cổng cũng được kiểm tra.
-        output = io.StringIO()
+    def test_discover_warn_is_acknowledged_by_flag(self) -> None:
+        # 16.382 × 64 = 1.048.448 lượt dò: vượt cảnh báo, cần xác nhận.
         discovery_ports = ",".join(str(port) for port in range(1000, 1064))
-        with mock.patch.object(
-            sys,
-            "argv",
+        code, text, discover, _ = self.invoke(
             [
-                "main.py",
+                "discover",
                 "127.0.0.0/18",
-                "--ports",
-                "80",
                 "--discovery-ports",
                 discovery_ports,
                 "--confirm-large-scan",
-            ],
-        ), mock.patch.object(
-            main, "discover_hosts", return_value=[]
-        ) as discover, contextlib.redirect_stdout(output):
-            code = main.main()
+            ]
+        )
 
         self.assertEqual(code, 0)
-        text = output.getvalue()
         self.assertIn(STAGE_LABELS[STAGE_DISCOVERY], text)
         self.assertIn("1.048.448", text)
         discover.assert_called_once()
+
+    def test_scan_hard_cap_uses_real_host_count(self) -> None:
+        # 100 host × 65.535 cổng = 6.553.500 > 5.000.000.
+        hosts = ",".join(f"127.0.0.{index}" for index in range(1, 101))
+        code, text, _, scan = self.invoke(
+            ["scan", "--hosts", hosts, "--ports", "1-65535"]
+        )
+
+        self.assertEqual(code, 1)
+        self.assertIn("6.553.500", text)
+        self.assertIn("giai đoạn quét cổng", text)
+        scan.assert_not_called()
+
+    def test_scan_warn_requires_confirmation(self) -> None:
+        # 14 host × 65.535 = 917.490: vượt cảnh báo, dưới trần cứng.
+        hosts = ",".join(f"127.0.0.{index}" for index in range(1, 15))
+        code, text, _, scan = self.invoke(
+            ["scan", "--hosts", hosts, "--ports", "1-65535"]
+        )
+
+        self.assertEqual(code, 1)
+        self.assertIn("917.490", text)
+        self.assertIn("--confirm-large-scan", text)
+        scan.assert_not_called()
+
+    def test_scan_warn_is_acknowledged_by_flag(self) -> None:
+        hosts = ",".join(f"127.0.0.{index}" for index in range(1, 15))
+        code, text, _, scan = self.invoke(
+            [
+                "scan",
+                "--hosts",
+                hosts,
+                "--ports",
+                "1-65535",
+                "--confirm-large-scan",
+            ]
+        )
+
+        self.assertEqual(code, 0)
+        self.assertIn("917.490", text)
+        self.assertEqual(scan.call_count, 14)
 
 
 if __name__ == "__main__":
