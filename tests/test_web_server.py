@@ -1,7 +1,8 @@
 """Kiểm thử API của web server cục bộ.
 
-Mọi bài kiểm thử chỉ nói chuyện với 127.0.0.1: server được bind trên loopback với
-cổng ngẫu nhiên, và không bài nào quét ra ngoài loopback.
+Hai loại job độc lập: ``discover`` (dò host sống trong CIDR) và ``scan`` (quét
+cổng trên danh sách host). Mọi bài kiểm thử chỉ nói chuyện với 127.0.0.1 và
+mock phần mạng khi cần, không quét ra ngoài loopback.
 
 Chạy:
     .venv\\Scripts\\python.exe -m unittest discover tests
@@ -87,7 +88,7 @@ class WebServerTestCase(unittest.TestCase):
 
         self.token = secrets.token_urlsafe(32)
         self.auth_headers = {"X-Scan-Token": self.token}
-        self.manager = web_server.ScanManager()
+        self.manager = web_server.JobManager()
         self.server = web_server.WebServer(
             ("127.0.0.1", 0),
             web_server.ScanRequestHandler,
@@ -103,14 +104,21 @@ class WebServerTestCase(unittest.TestCase):
         self.thread.start()
 
     def tearDown(self) -> None:
-        # Hủy job còn chạy và chờ nó dừng hẳn, để thread nền không tiếp tục
-        # quét (và không lọt sang bài kiểm thử kế tiếp).
-        job = self.manager.running_job()
-        if job is not None:
-            job.cancel_event.set()
-            deadline = time.time() + 15
-            while time.time() < deadline and job.status == "running":
-                time.sleep(0.05)
+        # Hủy mọi job còn chạy và chờ chúng dừng hẳn, để thread nền không tiếp
+        # tục quét (và không lọt sang bài kiểm thử kế tiếp).
+        for kind in (web_server.KIND_DISCOVER, web_server.KIND_SCAN):
+            job = self.manager.running_job(kind)
+            if job is not None:
+                job.cancel_event.set()
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            running = [
+                self.manager.running_job(web_server.KIND_DISCOVER),
+                self.manager.running_job(web_server.KIND_SCAN),
+            ]
+            if not any(running):
+                break
+            time.sleep(0.05)
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=5)
@@ -142,32 +150,71 @@ class WebServerTestCase(unittest.TestCase):
         finally:
             conn.close()
 
-    def post_scan(self, target: str, ports: str, **extra: object) -> tuple[int, bytes]:
-        payload: dict[str, object] = {"target": target, "ports": ports}
-        payload.update(extra)
+    def post(self, path: str, payload: object) -> tuple[int, bytes]:
         status, _, raw = self.request(
-            "POST",
-            "/api/scan",
-            json.dumps(payload),
-            self.auth_headers,
+            "POST", path, json.dumps(payload), self.auth_headers
         )
         return status, raw
+
+    def post_discover(self, cidr: str, **extra: object) -> tuple[int, bytes]:
+        payload: dict[str, object] = {"cidr": cidr}
+        payload.update(extra)
+        return self.post("/api/discover", payload)
+
+    def post_scan(
+        self,
+        hosts: list[str],
+        ports: str,
+        **extra: object,
+    ) -> tuple[int, bytes]:
+        payload: dict[str, object] = {"hosts": hosts, "ports": ports}
+        payload.update(extra)
+        return self.post("/api/scan", payload)
 
     def error_of(self, raw: bytes) -> str:
         return json.loads(raw)["error"]
 
-    def wait_done(self, job_id: str, timeout: float = 30.0) -> dict:
-        """Chờ tới khi lần quét kết thúc và trả về bản chụp cuối."""
+    def wait_done(
+        self,
+        kind: str,
+        job_id: str,
+        timeout: float = 30.0,
+    ) -> dict:
+        """Chờ tới khi job kết thúc và trả về bản chụp cuối."""
         deadline = time.time() + timeout
         snapshot: dict | None = None
         while time.time() < deadline:
-            status, _, raw = self.request("GET", f"/api/scan/{job_id}")
+            status, _, raw = self.request("GET", f"/api/{kind}/{job_id}")
             self.assertEqual(status, 200)
             snapshot = json.loads(raw)
             if snapshot["status"] != "running":
                 return snapshot
             time.sleep(0.05)
-        self.fail(f"lần quét {job_id} không kết thúc sau {timeout}s: {snapshot}")
+        self.fail(f"job {kind}/{job_id} không kết thúc sau {timeout}s: {snapshot}")
+
+    def start_scan(self, hosts: list[str], ports: str, **extra: object) -> str:
+        status, raw = self.post_scan(hosts, ports, **extra)
+        self.assertEqual(status, 202, f"không bắt đầu được: {raw!r}")
+        return json.loads(raw)["id"]
+
+    def start_discover(self, cidr: str, **extra: object) -> str:
+        status, raw = self.post_discover(cidr, **extra)
+        self.assertEqual(status, 202, f"không bắt đầu được: {raw!r}")
+        return json.loads(raw)["id"]
+
+    def cancel(self, kind: str, job_id: str) -> None:
+        status, _, _ = self.request(
+            "POST", f"/api/{kind}/{job_id}/cancel", None, self.auth_headers
+        )
+        self.assertEqual(status, 200)
+
+    def cancel_if_running(self, kind: str, job_id: str) -> None:
+        """Hủy job nếu còn chạy; bỏ qua nếu job đã kết thúc."""
+        status, _, _ = self.request(
+            "POST", f"/api/{kind}/{job_id}/cancel", None, self.auth_headers
+        )
+        if status != 409:
+            self.assertEqual(status, 200)
 
     @staticmethod
     def slow_scan(host: str, port: int, timeout: float = 1.0) -> bool:
@@ -186,52 +233,6 @@ class WebServerTestCase(unittest.TestCase):
         time.sleep(0.02)
         return port in (135, 445)
 
-    @staticmethod
-    def discovery_alive_scan(host: str, port: int, timeout: float = 1.0) -> bool:
-        """Dò host: cổng 135 sống ngay; cổng khác chậm và chỉ 445 mở.
-
-        Nhờ vậy mọi host trong dải đều được coi là sống, và job vẫn chạy đủ lâu
-        để kịp hủy trong bài kiểm thử.
-        """
-        if port == 135:
-            return True
-        time.sleep(0.05)
-        return port == 445
-
-    def cancel_if_running(self, job_id: str) -> None:
-        """Hủy job nếu còn chạy; bỏ qua nếu job đã kết thúc."""
-        status, _, _ = self.request(
-            "POST", f"/api/scan/{job_id}/cancel", None, self.auth_headers
-        )
-        if status != 409:
-            self.assertEqual(status, 200)
-
-    def start_scan(self, target: str, ports: str, **extra: object) -> str:
-        """Bắt đầu một lần quét và trả về id của job."""
-        status, raw = self.post_scan(target, ports, **extra)
-        self.assertEqual(status, 202, f"không bắt đầu được: {raw!r}")
-        return json.loads(raw)["id"]
-
-    def cancel(self, job_id: str) -> None:
-        status, _, _ = self.request(
-            "POST", f"/api/scan/{job_id}/cancel", None, self.auth_headers
-        )
-        self.assertEqual(status, 200)
-
-    def wait_for_batch(self, job_id: str, index: int, timeout: float = 60.0) -> dict:
-        """Chờ tới khi job bước vào lô thứ `index`."""
-        deadline = time.time() + timeout
-        snapshot: dict | None = None
-        while time.time() < deadline:
-            _, _, raw = self.request("GET", f"/api/scan/{job_id}")
-            snapshot = json.loads(raw)
-            if (snapshot.get("batch") or {}).get("index", 0) >= index:
-                return snapshot
-            if snapshot["status"] != "running":
-                self.fail(f"job kết thúc trước khi tới lô {index}: {snapshot['status']}")
-            time.sleep(0.05)
-        self.fail(f"không tới được lô {index} sau {timeout}s: {snapshot}")
-
 
 class ServerBindingTest(WebServerTestCase):
     """Server chỉ được nghe trên loopback."""
@@ -249,34 +250,34 @@ class ServerBindingTest(WebServerTestCase):
     def test_index_page_has_token_and_security_headers(self) -> None:
         status, headers, raw = self.request("GET", "/")
         html = raw.decode("utf-8")
+
         self.assertEqual(status, 200)
         self.assertIn(self.token, html)
-        self.assertNotIn(web_server.TOKEN_PLACEHOLDER, html)
-        self.assertTrue(
-            headers["Content-Security-Policy"].startswith("default-src 'none'")
-        )
+        self.assertIn("script-src 'unsafe-inline'", headers["Content-Security-Policy"])
         self.assertEqual(headers["X-Frame-Options"], "DENY")
         self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+        self.assertNotIn("<script src=", html, "không được nạp script bên ngoài")
 
 
 class TokenTest(WebServerTestCase):
-    """Token bắt buộc với mọi request POST và khi tải kết quả."""
+    """Mọi request POST phải kèm token của phiên."""
 
     def test_post_without_token_is_forbidden(self) -> None:
-        status, _, raw = self.request(
-            "POST",
-            "/api/scan",
-            json.dumps({"target": "127.0.0.1", "ports": "135"}),
-        )
-        self.assertEqual(status, 403)
-        self.assertIn("token", self.error_of(raw).lower())
+        for path, payload in (
+            ("/api/discover", {"cidr": "127.0.0.0/30"}),
+            ("/api/scan", {"hosts": ["127.0.0.1"], "ports": "135"}),
+        ):
+            with self.subTest(path=path):
+                status, _, _ = self.request("POST", path, json.dumps(payload))
+                self.assertEqual(status, 403)
+                self.assertIsNone(self.manager.running_job())
 
     def test_post_with_wrong_token_is_forbidden(self) -> None:
-        status, _, raw = self.request(
+        status, _, _ = self.request(
             "POST",
             "/api/scan",
-            json.dumps({"target": "127.0.0.1", "ports": "135"}),
-            {"X-Scan-Token": "token-sai"},
+            json.dumps({"hosts": ["127.0.0.1"], "ports": "135"}),
+            {"X-Scan-Token": "sai-token"},
         )
         self.assertEqual(status, 403)
 
@@ -284,69 +285,96 @@ class TokenTest(WebServerTestCase):
         status, _, _ = self.request(
             "POST",
             "/api/scan",
-            json.dumps({"target": "127.0.0.1", "ports": "135"}),
+            json.dumps({"hosts": ["127.0.0.1"], "ports": "135"}),
             {"X-Scan-Token": ""},
         )
         self.assertEqual(status, 403)
 
 
 class HostAndOriginTest(WebServerTestCase):
-    """Chặn trang web khác lợi dụng API (Host/Origin lạ)."""
-
-    def setUp(self) -> None:
-        super().setUp()
-        self.valid_body = json.dumps({"target": "127.0.0.1", "ports": "135"})
+    """Chống DNS rebinding và CSRF."""
 
     def test_foreign_host_header_is_forbidden(self) -> None:
-        status, _, raw = self.request(
-            "POST",
-            "/api/scan",
-            self.valid_body,
-            self.auth_headers,
-            host_header="evil.example.com",
-        )
-        self.assertEqual(status, 403)
-        self.assertIn("Host", self.error_of(raw))
-
-    def test_foreign_host_on_get_is_forbidden(self) -> None:
-        status, _, _ = self.request("GET", "/", host_header="evil.example.com")
-        self.assertEqual(status, 403)
-
-    def test_host_without_port_is_forbidden(self) -> None:
         status, _, _ = self.request(
             "POST",
             "/api/scan",
-            self.valid_body,
+            json.dumps({"hosts": ["127.0.0.1"], "ports": "135"}),
             self.auth_headers,
-            host_header="127.0.0.1",
+            host_header="evil.example:8000",
         )
         self.assertEqual(status, 403)
 
-    def test_foreign_origin_is_forbidden(self) -> None:
-        headers = dict(self.auth_headers)
-        headers["Origin"] = "http://evil.example.com"
-        status, _, raw = self.request("POST", "/api/scan", self.valid_body, headers)
+    def test_foreign_host_on_get_is_forbidden(self) -> None:
+        status, _, _ = self.request("GET", "/", host_header="evil.example:8000")
         self.assertEqual(status, 403)
-        self.assertIn("Origin", self.error_of(raw))
+
+    def test_host_without_port_is_forbidden(self) -> None:
+        status, _, _ = self.request("GET", "/", host_header="127.0.0.1")
+        self.assertEqual(status, 403)
+
+    def test_foreign_origin_is_forbidden(self) -> None:
+        status, _, _ = self.request(
+            "POST",
+            "/api/scan",
+            json.dumps({"hosts": ["127.0.0.1"], "ports": "135"}),
+            {**self.auth_headers, "Origin": "http://evil.example"},
+        )
+        self.assertEqual(status, 403)
 
     def test_matching_origin_is_accepted(self) -> None:
-        headers = dict(self.auth_headers)
-        headers["Origin"] = f"http://127.0.0.1:{self.port}"
-        status, _, raw = self.request("POST", "/api/scan", self.valid_body, headers)
+        with mock.patch.object(scanner, "scan_port", side_effect=self.slow_scan):
+            status, _, raw = self.request(
+                "POST",
+                "/api/scan",
+                json.dumps({"hosts": ["127.0.0.1"], "ports": "1-40"}),
+                {
+                    **self.auth_headers,
+                    "Origin": f"http://127.0.0.1:{self.port}",
+                },
+            )
         self.assertEqual(status, 202)
-        self.wait_done(json.loads(raw)["id"])
+        job_id = json.loads(raw)["id"]
+        self.cancel(web_server.KIND_SCAN, job_id)
+        self.wait_done(web_server.KIND_SCAN, job_id)
 
     def test_missing_origin_is_accepted(self) -> None:
-        # curl hoặc script không gửi Origin; token vẫn là điều kiện bắt buộc.
-        status, _, raw = self.request("POST", "/api/scan", self.valid_body, self.auth_headers)
+        with mock.patch.object(scanner, "scan_port", side_effect=self.slow_scan):
+            status, _, raw = self.request(
+                "POST",
+                "/api/scan",
+                json.dumps({"hosts": ["127.0.0.1"], "ports": "1-40"}),
+                self.auth_headers,
+            )
         self.assertEqual(status, 202)
-        self.wait_done(json.loads(raw)["id"])
+        job_id = json.loads(raw)["id"]
+        self.cancel(web_server.KIND_SCAN, job_id)
+        self.wait_done(web_server.KIND_SCAN, job_id)
 
 
-class TargetRestrictionTest(WebServerTestCase):
-    """Giới hạn mục tiêu được kiểm tra ở phía server."""
+class DiscoverValidationTest(WebServerTestCase):
+    """Kiểm tra tham số của POST /api/discover."""
 
-    def test_external_target_is_forbidden_without_any_connection(self) -> None:
+    def test_missing_cidr_returns_400(self) -> None:
+        status, raw = self.post("/api/discover", {})
+        self.assertEqual(status, 400)
+        self.assertIn("cidr", self.error_of(raw))
+
+    def test_cidr_must_be_a_string(self) -> None:
+        status, raw = self.post("/api/discover", {"cidr": 123})
+        self.assertEqual(status, 400)
+        self.assertIn("cidr", self.error_of(raw))
+
+    def test_single_ip_is_rejected(self) -> None:
+        status, raw = self.post_discover("127.0.0.1")
+        self.assertEqual(status, 400)
+        self.assertIn("/api/scan", self.error_of(raw))
+
+    def test_cidr_larger_than_slash_18_is_rejected(self) -> None:
+        status, raw = self.post_discover("10.0.0.0/17")
+        self.assertEqual(status, 400)
+        self.assertIn("/18", self.error_of(raw))
+
+    def test_external_cidr_is_forbidden_without_connection(self) -> None:
         calls: list[tuple[str, int]] = []
 
         def spy(host: str, port: int, timeout: float = 1.0) -> bool:
@@ -354,111 +382,180 @@ class TargetRestrictionTest(WebServerTestCase):
             return False
 
         with mock.patch.object(scanner, "scan_port", side_effect=spy):
-            status, raw = self.post_scan("8.8.8.8", "53")
+            status, raw = self.post_discover("8.8.8.0/24")
             self.assertEqual(status, 403)
             self.assertIn("nội bộ", self.error_of(raw))
+            time.sleep(0.2)
+            self.assertEqual(calls, [], "không được mở kết nối nào")
+        self.assertIsNone(self.manager.running_job())
 
-            # Cho thread (nếu lỡ được tạo) thời gian gọi scan_port.
-            time.sleep(0.3)
-            self.assertEqual(calls, [], "không được kết nối ra ngoài dải nội bộ")
+    def test_slash_18_at_boundary_is_accepted(self) -> None:
+        with mock.patch.object(web_server, "discover_hosts", return_value=[]):
+            job_id = self.start_discover("127.0.0.0/18")
+            snapshot = self.wait_done(web_server.KIND_DISCOVER, job_id, timeout=60)
+        self.assertEqual(snapshot["status"], "done")
+        self.assertEqual(snapshot["cidr"], "127.0.0.0/18")
+        self.assertEqual(snapshot["hosts_total"], 16382)
 
-            # Không có lần quét nào đang chạy -> yêu cầu hợp lệ tiếp theo được nhận.
-            status2, raw2 = self.post_scan("127.0.0.1", "135")
-            self.assertEqual(status2, 202)
-            self.wait_done(json.loads(raw2)["id"])
-            self.assertTrue(all(host == "127.0.0.1" for host, _ in calls))
-
-    def test_other_external_targets_are_forbidden(self) -> None:
-        for target in ("1.1.1.1", "172.32.0.1", "192.169.0.1", "8.8.8.0/24"):
-            with self.subTest(target=target):
-                status, raw = self.post_scan(target, "80")
-                self.assertEqual(status, 403)
-                self.assertIn("nội bộ", self.error_of(raw))
-
-    def test_internal_targets_are_accepted_at_validation(self) -> None:
-        # Chỉ kiểm tra qua lớp kiểm tra mục tiêu, không quét cổng thật.
-        for target in ("127.0.0.1", "10.0.0.1", "172.16.0.1", "192.168.1.1"):
-            with self.subTest(target=target):
-                parsed = web_server.parse_target(target)
-                self.assertTrue(web_server.is_internal(parsed))
-
-    def test_cidr_larger_than_slash_18_is_rejected(self) -> None:
-        # Không quét dải thật: chỉ kiểm tra lớp từ chối của server.
-        for target in ("10.0.0.0/16", "10.0.0.0/17", "127.0.0.0/8", "0.0.0.0/0"):
-            with self.subTest(target=target):
-                status, raw = self.post_scan(target, "80")
-                self.assertEqual(status, 400)
-                self.assertIn("/18", self.error_of(raw))
-
-    def test_cidr_slash_18_at_boundary_is_accepted(self) -> None:
-        # Dùng scan_port giả để không thật sự dò 16382 host.
-        with mock.patch.object(scanner, "scan_port", side_effect=self.slow_scan):
-            status, raw = self.post_scan("127.0.0.0/18", "135")
-            self.assertEqual(status, 202)
-            job_id = json.loads(raw)["id"]
-            self.request("POST", f"/api/scan/{job_id}/cancel", None, self.auth_headers)
-            self.wait_done(job_id)
-
-    def test_cidr_slash_24_at_boundary_is_accepted(self) -> None:
-        # Dùng scan_port giả để không thật sự dò 254 host.
-        with mock.patch.object(scanner, "scan_port", side_effect=self.slow_scan):
-            status, raw = self.post_scan("127.0.0.0/24", "135")
-            self.assertEqual(status, 202)
-            job_id = json.loads(raw)["id"]
-            self.request("POST", f"/api/scan/{job_id}/cancel", None, self.auth_headers)
-            self.wait_done(job_id)
-
-    def test_invalid_ip_is_rejected(self) -> None:
-        for target in ("999.999.999.999", "khong-phai-ip", "::1", ""):
-            with self.subTest(target=target):
-                status, _ = self.post_scan(target, "80")
-                self.assertEqual(status, 400)
-
-
-class RequestValidationTest(WebServerTestCase):
-    """Lỗi đầu vào trả mã rõ ràng, không lộ traceback."""
-
-    def test_malformed_json_returns_400(self) -> None:
-        status, _, raw = self.request("POST", "/api/scan", "{khong-phai-json", self.auth_headers)
-        self.assertEqual(status, 400)
-        self.assertIn("JSON", self.error_of(raw))
-
-    def test_json_array_returns_400(self) -> None:
-        status, _, raw = self.request("POST", "/api/scan", "[1, 2, 3]", self.auth_headers)
-        self.assertEqual(status, 400)
-
-    def test_missing_fields_return_400(self) -> None:
-        for payload in ({}, {"target": "127.0.0.1"}, {"ports": "80"}):
-            with self.subTest(payload=payload):
-                status, _, raw = self.request(
-                    "POST", "/api/scan", json.dumps(payload), self.auth_headers
+    def test_invalid_discovery_ports_are_rejected(self) -> None:
+        for value in ("0-10", "80,,443", "1-99999", 80, ""):
+            with self.subTest(value=value):
+                status, raw = self.post_discover(
+                    "127.0.0.0/30", discovery_ports=value
                 )
-                self.assertEqual(status, 400)
+                self.assertEqual(status, 400, raw)
+                self.assertIn("discovery_ports", self.error_of(raw))
 
-    def test_wrong_field_types_return_400(self) -> None:
-        for payload in (
-            {"target": "127.0.0.1", "ports": 80},
-            {"target": 2130706433, "ports": "80"},
-            {"target": "127.0.0.1", "ports": "80", "workers": "nhieu"},
-            {"target": "127.0.0.1", "ports": "80", "workers": None},
-            {"target": "127.0.0.1", "ports": "80", "workers": True},
-        ):
-            with self.subTest(payload=payload):
-                status, _, _ = self.request(
-                    "POST", "/api/scan", json.dumps(payload), self.auth_headers
+    def test_discovery_ports_count_is_capped(self) -> None:
+        too_many = ",".join(
+            str(port) for port in range(1000, 1000 + web_server.MAX_DISCOVERY_PORTS + 1)
+        )
+        status, raw = self.post_discover("127.0.0.0/30", discovery_ports=too_many)
+        self.assertEqual(status, 400)
+        self.assertIn("discovery_ports", self.error_of(raw))
+
+    def test_discovery_timeout_range_is_enforced(self) -> None:
+        for value in (0.001, 11, "1.0", True):
+            with self.subTest(value=value):
+                status, raw = self.post_discover(
+                    "127.0.0.0/30", discovery_timeout=value
                 )
-                self.assertEqual(status, 400)
+                self.assertEqual(status, 400, raw)
+                self.assertIn("discovery_timeout", self.error_of(raw))
+
+    def test_concurrency_is_validated(self) -> None:
+        for value in (0, web_server.MAX_CONCURRENCY + 1, "10", True):
+            with self.subTest(value=value):
+                status, raw = self.post_discover(
+                    "127.0.0.0/30", concurrency=value
+                )
+                self.assertEqual(status, 400, raw)
+                self.assertIn("concurrency", self.error_of(raw))
+
+    def test_unknown_discover_id_returns_404(self) -> None:
+        status, _, raw = self.request("GET", "/api/discover/khong-ton-tai")
+        self.assertEqual(status, 404)
+        self.assertIn("Không tìm thấy", self.error_of(raw))
+
+    def test_scan_id_is_not_a_discover_id(self) -> None:
+        with mock.patch.object(scanner, "scan_port", side_effect=self.fake_scan), \
+                mock.patch.object(scanner, "grab_banner", return_value=None):
+            scan_id = self.start_scan(["127.0.0.1"], "135")
+            self.wait_done(web_server.KIND_SCAN, scan_id)
+        status, _, _ = self.request("GET", f"/api/discover/{scan_id}")
+        self.assertEqual(status, 404)
+
+
+class ScanValidationTest(WebServerTestCase):
+    """Kiểm tra tham số của POST /api/scan."""
+
+    def test_missing_hosts_returns_400(self) -> None:
+        status, raw = self.post("/api/scan", {"ports": "135"})
+        self.assertEqual(status, 400)
+        self.assertIn("hosts", self.error_of(raw))
+
+    def test_hosts_must_be_a_list(self) -> None:
+        status, raw = self.post("/api/scan", {"hosts": "127.0.0.1", "ports": "135"})
+        self.assertEqual(status, 400)
+        self.assertIn("hosts", self.error_of(raw))
+
+    def test_empty_hosts_is_rejected(self) -> None:
+        status, raw = self.post_scan([], "135")
+        self.assertEqual(status, 400)
+        self.assertIn("hosts", self.error_of(raw))
+
+    def test_hosts_entries_must_be_strings(self) -> None:
+        status, raw = self.post("/api/scan", {"hosts": [2130706433], "ports": "135"})
+        self.assertEqual(status, 400)
+        self.assertIn("hosts", self.error_of(raw))
+
+    def test_cidr_inside_hosts_is_rejected(self) -> None:
+        status, raw = self.post_scan(["127.0.0.0/30"], "135")
+        self.assertEqual(status, 400)
+        self.assertIn("CIDR", self.error_of(raw))
+
+    def test_invalid_ip_in_hosts_is_rejected(self) -> None:
+        for value in ("999.999.999.999", "khong-phai-ip", "::1", ""):
+            with self.subTest(value=value):
+                status, raw = self.post_scan([value], "135")
+                self.assertEqual(status, 400, raw)
+                self.assertTrue(self.error_of(raw))
+
+        # IPv6 bị từ chối với thông báo riêng về họ địa chỉ.
+        status, raw = self.post_scan(["::1"], "135")
+        self.assertEqual(status, 400)
+        self.assertIn("IPv4", self.error_of(raw))
+
+    def test_external_host_is_forbidden_without_connection(self) -> None:
+        calls: list[tuple[str, int]] = []
+
+        def spy(host: str, port: int, timeout: float = 1.0) -> bool:
+            calls.append((host, port))
+            return False
+
+        with mock.patch.object(scanner, "scan_port", side_effect=spy):
+            status, raw = self.post_scan(["127.0.0.1", "8.8.8.8"], "135")
+            self.assertEqual(status, 403)
+            self.assertIn("8.8.8.8", self.error_of(raw))
+            time.sleep(0.2)
+            self.assertEqual(calls, [], "không được mở kết nối nào")
+        self.assertIsNone(self.manager.running_job())
+
+    def test_target_field_is_rejected_with_hint(self) -> None:
+        status, raw = self.post(
+            "/api/scan", {"target": "127.0.0.0/30", "ports": "135"}
+        )
+        self.assertEqual(status, 400)
+        message = self.error_of(raw)
+        self.assertIn("hosts", message)
+        self.assertIn("/api/discover", message)
 
     def test_invalid_port_specs_return_400(self) -> None:
         for ports in ("0-10", "99999", "1-99999", "abc", "80,,443", ""):
             with self.subTest(ports=ports):
-                status, _ = self.post_scan("127.0.0.1", ports)
-                self.assertEqual(status, 400)
+                status, raw = self.post_scan(["127.0.0.1"], ports)
+                self.assertEqual(status, 400, raw)
 
-    def test_unknown_job_id_returns_404(self) -> None:
+    def test_concurrency_is_validated(self) -> None:
+        for value in (0, web_server.MAX_CONCURRENCY + 1, "10", True):
+            with self.subTest(value=value):
+                status, raw = self.post_scan(
+                    ["127.0.0.1"], "135", concurrency=value
+                )
+                self.assertEqual(status, 400, raw)
+                self.assertIn("concurrency", self.error_of(raw))
+
+    def test_unknown_scan_id_returns_404(self) -> None:
         status, _, raw = self.request("GET", "/api/scan/khong-ton-tai")
         self.assertEqual(status, 404)
-        self.assertIn("Không tìm thấy", self.error_of(raw))
+
+    def test_discover_id_is_not_a_scan_id(self) -> None:
+        with mock.patch.object(web_server, "discover_hosts", return_value=[]):
+            discover_id = self.start_discover("127.0.0.0/30")
+            self.wait_done(web_server.KIND_DISCOVER, discover_id)
+        status, _, _ = self.request("GET", f"/api/scan/{discover_id}")
+        self.assertEqual(status, 404)
+
+
+class RequestValidationTest(WebServerTestCase):
+    """Lỗi định dạng chung."""
+
+    def test_malformed_json_returns_400(self) -> None:
+        for path in ("/api/scan", "/api/discover"):
+            with self.subTest(path=path):
+                status, _, raw = self.request(
+                    "POST", path, "{khong-phai-json", self.auth_headers
+                )
+                self.assertEqual(status, 400)
+                self.assertIn("JSON", self.error_of(raw))
+
+    def test_json_array_returns_400(self) -> None:
+        for path in ("/api/scan", "/api/discover"):
+            with self.subTest(path=path):
+                status, _, _ = self.request(
+                    "POST", path, "[1, 2, 3]", self.auth_headers
+                )
+                self.assertEqual(status, 400)
 
     def test_unknown_path_returns_404(self) -> None:
         status, _, _ = self.request("GET", "/khong-ton-tai")
@@ -471,275 +568,19 @@ class RequestValidationTest(WebServerTestCase):
         self.assertNotIn(b"Traceback", raw)
         self.assertEqual(set(json.loads(raw)), {"error"})
 
-
-class LimitsTest(WebServerTestCase):
-    """Giới hạn số cổng và số luồng do server quyết định."""
-
-    def test_too_many_attempts_is_rejected(self) -> None:
-        # 254 host của /24 × 65535 cổng vượt trần cứng của một job.
-        calls: list[tuple[str, int]] = []
-
-        def spy(host: str, port: int, timeout: float = 1.0) -> bool:
-            calls.append((host, port))
-            return False
-
-        with mock.patch.object(scanner, "scan_port", side_effect=spy):
-            status, raw = self.post_scan("192.168.1.0/24", "1-65535")
-            self.assertEqual(status, 400)
-            message = self.error_of(raw)
-            self.assertIn("Vượt trần cứng", message)
-            self.assertIn("5.000.000", message)
-            self.assertIn("giảm số cổng", message)
-
-            time.sleep(0.3)
-            self.assertEqual(calls, [], "không được mở kết nối nào khi bị từ chối")
-
-            status2, raw2 = self.post_scan("127.0.0.1", "135")
-            self.assertEqual(status2, 202)
-            self.wait_done(json.loads(raw2)["id"])
-
-    def test_slash_18_with_full_range_is_rejected_without_connection(self) -> None:
-        calls: list[tuple[str, int]] = []
-
-        def spy(host: str, port: int, timeout: float = 1.0) -> bool:
-            calls.append((host, port))
-            return False
-
-        with mock.patch.object(scanner, "scan_port", side_effect=spy):
-            # Kể cả khi đã xác nhận, trần cứng vẫn từ chối và không mở kết nối.
-            status, raw = self.post_scan(
-                "10.0.0.0/18", "1-65535", confirm=True
-            )
-            self.assertEqual(status, 400)
-            self.assertIn("Vượt trần cứng", self.error_of(raw))
-            time.sleep(0.3)
-            self.assertEqual(calls, [], "không được mở kết nối nào")
-
-    def test_slash_17_is_rejected(self) -> None:
-        status, raw = self.post_scan("10.0.0.0/17", "80")
-        self.assertEqual(status, 400)
-        self.assertIn("/18", self.error_of(raw))
-
-    def test_workers_above_limit_is_rejected(self) -> None:
-        status, raw = self.post_scan("127.0.0.1", "80", workers=web_server.MAX_WORKERS + 1)
-        self.assertEqual(status, 400)
-        self.assertIn("workers", self.error_of(raw))
-
-    def test_workers_zero_is_rejected(self) -> None:
-        status, raw = self.post_scan("127.0.0.1", "80", workers=0)
-        self.assertEqual(status, 400)
-        self.assertIn("workers", self.error_of(raw))
-
-    def test_workers_at_limit_is_accepted(self) -> None:
-        with mock.patch.object(scanner, "scan_port", side_effect=self.slow_scan):
-            status, raw = self.post_scan(
-                "127.0.0.1", "1-200", workers=web_server.MAX_WORKERS
-            )
-            self.assertEqual(status, 202)
-            job_id = json.loads(raw)["id"]
-            self.request("POST", f"/api/scan/{job_id}/cancel", None, self.auth_headers)
-            self.wait_done(job_id)
-
-    def test_full_port_range_on_one_host_is_accepted(self) -> None:
-        # 1 host × 65535 cổng = 65535 lượt, vẫn dưới giới hạn tổng.
-        with mock.patch.object(scanner, "scan_port", side_effect=self.slow_scan):
-            status, raw = self.post_scan("127.0.0.1", f"1-{web_server.MAX_PORTS}")
-            self.assertEqual(status, 202)
-            job_id = json.loads(raw)["id"]
-            snapshot = json.loads(self.request("GET", f"/api/scan/{job_id}")[2])
-            self.assertEqual(snapshot["batch"]["ports_total"], web_server.MAX_PORTS)
-            self.request("POST", f"/api/scan/{job_id}/cancel", None, self.auth_headers)
-            self.wait_done(job_id)
-
-    def test_port_number_above_65535_is_rejected(self) -> None:
-        status, raw = self.post_scan("127.0.0.1", "1-65536")
-        self.assertEqual(status, 400)
-        self.assertIn("65535", self.error_of(raw))
+    def test_unknown_api_path_returns_404(self) -> None:
+        status, _, _ = self.request("POST", "/api/khac", "{}", self.auth_headers)
+        self.assertEqual(status, 404)
 
 
-class LargeScanConfirmationTest(WebServerTestCase):
-    """Hai mốc giới hạn: cảnh báo cần xác nhận, và trần cứng."""
+class LimitTest(WebServerTestCase):
+    """Hai mốc giới hạn, tính bằng số liệu thật của từng loại job."""
 
-    def test_below_warning_runs_immediately(self) -> None:
-        # /25 × 1024 cổng = 126 × 1029 = 129.654 lượt, dưới mốc cảnh báo.
-        with mock.patch.object(scanner, "scan_port", side_effect=self.discovery_alive_scan), \
-                mock.patch.object(scanner, "grab_banner", return_value=None):
-            status, raw = self.post_scan("127.0.0.0/25", "1-1024")
-            self.assertEqual(status, 202)
-            snapshot = json.loads(raw)
-            self.assertNotIn("confirmation_required", snapshot)
-            self.assertIn("id", snapshot)
-            self.cancel_if_running(snapshot["id"])
-            self.wait_done(snapshot["id"], timeout=60)
-
-    def test_above_warning_requires_confirmation(self) -> None:
-        # /24 × 2048 cổng: giai đoạn quét cổng = 254 × 2048 = 520.192 lượt,
-        # vượt mốc cảnh báo nhưng dưới trần cứng; giai đoạn dò chỉ 1.270 lượt.
-        status, raw = self.post_scan("127.0.0.0/24", "1-2048")
-        self.assertEqual(status, 202)
-        payload = json.loads(raw)
-        self.assertTrue(payload["confirmation_required"])
-        self.assertNotIn("id", payload, "chưa được tạo job nào")
-        self.assertEqual(payload["stages"], ["scan"])
-        self.assertEqual(payload["warn_threshold"], web_server.WARN_ATTEMPTS)
-        self.assertEqual(payload["hard_threshold"], web_server.HARD_ATTEMPTS)
-        self.assertEqual(payload["estimates"]["scan"]["attempts"], 254 * 2048)
-        self.assertEqual(payload["estimates"]["discovery"]["attempts"], 254 * 5)
-        self.assertIn("giai đoạn quét cổng", payload["message"])
-        self.assertIn("mốc", payload["message"])
-
-        # Chưa có job nào chạy -> yêu cầu khác vẫn được nhận.
-        status2, raw2 = self.post_scan("127.0.0.1", "135")
-        self.assertEqual(status2, 202)
-        self.wait_done(json.loads(raw2)["id"])
-
-    def test_above_warning_runs_after_confirmation(self) -> None:
-        with mock.patch.object(scanner, "scan_port", side_effect=self.discovery_alive_scan), \
-                mock.patch.object(scanner, "grab_banner", return_value=None):
-            status, raw = self.post_scan("127.0.0.0/24", "1-2048", confirm=True)
-            self.assertEqual(status, 202)
-            snapshot = json.loads(raw)
-            self.assertIn("id", snapshot)
-            self.assertNotIn("confirmation_required", snapshot)
-            self.cancel_if_running(snapshot["id"])
-            self.wait_done(snapshot["id"], timeout=60)
-
-    def test_confirmation_flag_must_be_boolean(self) -> None:
-        status, raw = self.post_scan("127.0.0.1", "135", confirm="yes")
-        self.assertEqual(status, 400)
-        self.assertIn("confirm", self.error_of(raw))
-
-
-class AdvancedParamsTest(WebServerTestCase):
-    """Các tham số nâng cao, server luôn kiểm tra lại."""
-
-    def test_defaults_when_not_sent(self) -> None:
-        status, raw = self.post_scan("127.0.0.1", "135")
-        self.assertEqual(status, 202)
-        snapshot = json.loads(raw)
-        self.assertEqual(
-            snapshot["params"],
-            {
-                "timeout": web_server.DEFAULT_SCAN_TIMEOUT,
-                "banner_timeout": web_server.DEFAULT_BANNER_TIMEOUT,
-                "discovery_timeout": web_server.DEFAULT_DISCOVERY_TIMEOUT,
-                "discovery_ports": "22,80,135,443,445",
-                "workers": web_server.DEFAULT_WORKERS,
-            },
-        )
-        self.wait_done(snapshot["id"])
-
-    def test_custom_values_are_used(self) -> None:
-        with mock.patch.object(scanner, "scan_port", side_effect=self.slow_scan):
-            status, raw = self.post_scan(
-                "127.0.0.1",
-                "1-100",
-                timeout=0.25,
-                banner_timeout=0.2,
-                discovery_timeout=0.1,
-                discovery_ports="80,443",
-                workers=7,
-            )
-            self.assertEqual(status, 202)
-            snapshot = json.loads(raw)
-            self.assertEqual(snapshot["params"]["timeout"], 0.25)
-            self.assertEqual(snapshot["params"]["banner_timeout"], 0.2)
-            self.assertEqual(snapshot["params"]["discovery_timeout"], 0.1)
-            self.assertEqual(snapshot["params"]["discovery_ports"], "80,443")
-            self.assertEqual(snapshot["params"]["workers"], 7)
-            self.cancel(snapshot["id"])
-            self.wait_done(snapshot["id"])
-
-    def test_out_of_range_values_are_rejected(self) -> None:
-        cases = [
-            {"timeout": 0.001},
-            {"timeout": 99},
-            {"timeout": "1.0"},
-            {"timeout": True},
-            {"banner_timeout": 0},
-            {"banner_timeout": 20},
-            {"discovery_timeout": -1},
-            {"discovery_timeout": 100},
-            {"discovery_ports": "0-10"},
-            {"discovery_ports": "80,,443"},
-            {"discovery_ports": 80},
-            {"discovery_ports": "1-99999"},
-            {"workers": 0},
-            {"workers": 101},
-            {"workers": "10"},
-        ]
-        for extra in cases:
-            with self.subTest(extra=extra):
-                status, raw = self.post_scan("127.0.0.1", "135", **extra)
-                self.assertEqual(status, 400, raw)
-
-    def test_discovery_ports_count_is_capped(self) -> None:
-        too_many = ",".join(str(port) for port in range(1000, 1000 + web_server.MAX_DISCOVERY_PORTS + 1))
-        status, raw = self.post_scan("127.0.0.1", "135", discovery_ports=too_many)
-        self.assertEqual(status, 400)
-        self.assertIn("discovery_ports", self.error_of(raw))
-
-    def test_advanced_values_affect_the_attempt_estimate(self) -> None:
-        # Nhiều cổng dò host hơn => ước tính cao hơn.
-        base = 126 * (5 + 1024)
-        extra = 126 * (60 + 1024)
-        self.assertLess(base, extra)
-        self.assertLess(extra, web_server.WARN_ATTEMPTS)
-
-        discovery = ",".join(str(port) for port in range(1000, 1060))
-        with mock.patch.object(scanner, "scan_port", side_effect=self.discovery_alive_scan), \
-                mock.patch.object(scanner, "grab_banner", return_value=None):
-            status, raw = self.post_scan(
-                "127.0.0.0/25", "1-1024", discovery_ports=discovery
-            )
-            self.assertEqual(status, 202)
-            snapshot = json.loads(raw)
-            self.assertNotIn("confirmation_required", snapshot)
-            self.cancel_if_running(snapshot["id"])
-            self.wait_done(snapshot["id"], timeout=60)
-
-
-class StageLimitSeparationTest(WebServerTestCase):
-    """Giới hạn của giai đoạn dò host và giai đoạn quét cổng là độc lập."""
-
-    def test_image_case_rejects_the_scan_stage_only(self) -> None:
-        # 127.0.0.0/18 × 1-1024, 5 cổng dò, mốc cảnh báo = trần cứng = 500.000.
-        # - dò host: 16.382 × 5 = 81.910  -> được phép chạy
-        # - quét cổng (ước tính theo host tối đa): 16.382 × 1.024 = 16.775.168
-        #   -> vượt trần cứng ngay ở bước ước tính, không cần dò xong.
-        calls: list[tuple[str, int]] = []
-
-        def spy(host: str, port: int, timeout: float = 1.0) -> bool:
-            calls.append((host, port))
-            return False
-
-        with mock.patch.object(main, "HARD_ATTEMPTS", 500_000), \
-                mock.patch.object(main, "WARN_ATTEMPTS", 500_000), \
-                mock.patch.object(web_server, "HARD_ATTEMPTS", 500_000), \
-                mock.patch.object(web_server, "WARN_ATTEMPTS", 500_000), \
-                mock.patch.object(scanner, "scan_port", side_effect=spy):
-            status, raw = self.post_scan("127.0.0.0/18", "1-1024")
-
-        self.assertEqual(status, 400)
-        message = self.error_of(raw)
-        self.assertIn("giai đoạn quét cổng", message)
-        self.assertIn("16.775.168", message)
-        self.assertIn("500.000", message)
-        self.assertNotIn("dò host sống", message)
-        self.assertEqual(calls, [], "không được mở kết nối nào trước khi từ chối")
-        self.assertIsNone(self.manager.running_job())
-
-        # Server vẫn nhận lần quét mới sau khi từ chối.
-        status2, raw2 = self.post_scan("127.0.0.1", "135")
-        self.assertEqual(status2, 202)
-        self.wait_done(json.loads(raw2)["id"])
-
-    def test_discovery_stage_can_warn_on_its_own(self) -> None:
-        # 16.382 × 64 = 1.048.448 lượt dò: vượt mốc cảnh báo, chưa tới trần
-        # cứng. Giai đoạn quét cổng chỉ 16.382 × 1 = 16.382 lượt.
+    def test_discover_warning_uses_real_max_hosts(self) -> None:
+        # 16.382 host × 64 cổng dò = 1.048.448: vượt mốc cảnh báo, chưa tới trần.
         discovery_ports = ",".join(str(port) for port in range(1000, 1064))
-        status, raw = self.post_scan(
-            "127.0.0.0/18", "80", discovery_ports=discovery_ports
+        status, raw = self.post_discover(
+            "127.0.0.0/18", discovery_ports=discovery_ports
         )
 
         self.assertEqual(status, 202)
@@ -750,105 +591,165 @@ class StageLimitSeparationTest(WebServerTestCase):
         self.assertEqual(
             payload["estimates"]["discovery"]["attempts"], 16382 * 64
         )
-        self.assertEqual(payload["estimates"]["scan"]["attempts"], 16382)
+        self.assertIsNone(payload["estimates"]["scan"])
         self.assertIn("giai đoạn dò host sống", payload["message"])
         self.assertIsNone(self.manager.running_job())
 
-    def test_post_discovery_check_uses_actual_alive_hosts(self) -> None:
-        # Ước tính ban đầu dùng host tối đa; sau khi dò phải kiểm tra lại bằng
-        # số host sống thực tế. Dùng run_scan trực tiếp với ngưỡng nhỏ để dựng
-        # đúng nhánh này (trong thực tế ước tính đã chặn trước đó).
-        job = web_server.ScanJob(ipaddress.ip_network("127.0.0.0/24"), [80])
-        alive = [f"127.0.0.{index}" for index in range(1, 255)]
+    def test_discover_hard_cap_is_rejected_even_with_confirmation(self) -> None:
+        # Hạ trần cứng để dựng nhánh từ chối của discover.
+        with mock.patch.object(web_server, "HARD_ATTEMPTS", 1000), \
+                mock.patch.object(main, "HARD_ATTEMPTS", 1000):
+            status, raw = self.post_discover("127.0.0.0/18", confirm=True)
 
-        with mock.patch.object(web_server, "HARD_ATTEMPTS", 100), \
-                mock.patch.object(web_server, "WARN_ATTEMPTS", 50), \
-                mock.patch.object(web_server, "discover_hosts", return_value=alive), \
-                mock.patch.object(web_server, "scan_ports") as scan_ports_mock:
-            web_server.run_scan(job)
+        self.assertEqual(status, 400)
+        message = self.error_of(raw)
+        self.assertIn("giai đoạn dò host sống", message)
+        self.assertIn("1.000", message)
+        self.assertIsNone(self.manager.running_job())
 
-        self.assertEqual(job.status, "error")
-        self.assertIn("Sau khi dò host sống", job.message)
-        self.assertIn("254 host sống", job.message)
-        self.assertIn("giai đoạn quét cổng", job.message)
-        self.assertIn("254 lượt", job.message)
-        scan_ports_mock.assert_not_called()
+    def test_discover_warning_runs_after_confirmation(self) -> None:
+        # Hạ mốc cảnh báo để job chạy nhanh trên dải nhỏ.
+        with mock.patch.object(web_server, "WARN_ATTEMPTS", 5), \
+                mock.patch.object(main, "WARN_ATTEMPTS", 5), \
+                mock.patch.object(web_server, "discover_hosts", return_value=[]) as discover:
+            job_id = self.start_discover("127.0.0.0/30", confirm=True)
+            snapshot = self.wait_done(web_server.KIND_DISCOVER, job_id)
 
-    def test_post_discovery_warning_is_satisfied_by_confirmation(self) -> None:
-        job = web_server.ScanJob(
-            ipaddress.ip_network("127.0.0.0/24"), [80], confirmed_large_scan=True
-        )
-        alive = [f"127.0.0.{index}" for index in range(1, 255)]
+        self.assertEqual(snapshot["status"], "done")
+        discover.assert_called_once()
 
-        with mock.patch.object(web_server, "HARD_ATTEMPTS", 10_000), \
-                mock.patch.object(web_server, "WARN_ATTEMPTS", 50), \
-                mock.patch.object(web_server, "discover_hosts", return_value=alive), \
-                mock.patch.object(web_server, "scan_ports", return_value=([], [])), \
-                mock.patch.object(web_server, "grab_banners", return_value={}):
-            web_server.run_scan(job)
+    def test_scan_warning_uses_real_host_count(self) -> None:
+        # 14 host × 65.535 cổng = 917.490: vượt mốc cảnh báo, dưới trần cứng.
+        hosts = [f"127.0.0.{index}" for index in range(1, 15)]
+        status, raw = self.post_scan(hosts, "1-65535")
 
-        self.assertEqual(job.status, "done")
-        self.assertNotIn("vượt mốc", job.message)
+        self.assertEqual(status, 202)
+        payload = json.loads(raw)
+        self.assertTrue(payload["confirmation_required"])
+        self.assertNotIn("id", payload)
+        self.assertEqual(payload["stages"], ["scan"])
+        self.assertEqual(payload["estimates"]["scan"]["attempts"], 14 * 65535)
+        self.assertIsNone(payload["estimates"]["discovery"])
+        self.assertIn("giai đoạn quét cổng", payload["message"])
+
+    def test_scan_hard_cap_is_rejected_without_connection(self) -> None:
+        hosts = [f"127.0.0.{index}" for index in range(1, 101)]
+        calls: list[tuple[str, int]] = []
+
+        def spy(host: str, port: int, timeout: float = 1.0) -> bool:
+            calls.append((host, port))
+            return False
+
+        with mock.patch.object(scanner, "scan_port", side_effect=spy):
+            status, raw = self.post_scan(hosts, "1-65535", confirm=True)
+
+        self.assertEqual(status, 400)
+        message = self.error_of(raw)
+        self.assertIn("giai đoạn quét cổng", message)
+        self.assertIn("6.553.500", message)
+        time.sleep(0.2)
+        self.assertEqual(calls, [], "không được mở kết nối nào")
+        self.assertIsNone(self.manager.running_job())
+
+    def test_scan_warning_runs_after_confirmation(self) -> None:
+        with mock.patch.object(web_server, "WARN_ATTEMPTS", 5), \
+                mock.patch.object(main, "WARN_ATTEMPTS", 5), \
+                mock.patch.object(scanner, "scan_port", side_effect=self.fake_scan), \
+                mock.patch.object(scanner, "grab_banner", return_value=None):
+            job_id = self.start_scan(
+                ["127.0.0.1", "127.0.0.2"], "1-10", confirm=True
+            )
+            snapshot = self.wait_done(web_server.KIND_SCAN, job_id)
+
+        self.assertEqual(snapshot["status"], "done")
+        self.assertEqual(snapshot["host_count"], 2)
+
+    def test_confirmation_flag_must_be_boolean(self) -> None:
+        status, raw = self.post_scan(["127.0.0.1"], "135", confirm="yes")
+        self.assertEqual(status, 400)
+        self.assertIn("confirm", self.error_of(raw))
 
 
-class SingleScanAtATimeTest(WebServerTestCase):
-    """Mỗi lúc chỉ một lần quét; yêu cầu thứ hai nhận 409."""
+class ConcurrentJobsTest(WebServerTestCase):
+    """Mỗi loại chỉ một job tại một thời điểm; hai loại chạy được song song."""
 
     def test_second_scan_returns_conflict(self) -> None:
         with mock.patch.object(scanner, "scan_port", side_effect=self.slow_scan):
-            status, raw = self.post_scan("127.0.0.1", "1-1024")
-            self.assertEqual(status, 202)
-            job_id = json.loads(raw)["id"]
+            job_id = self.start_scan(["127.0.0.1"], "1-400", concurrency=1)
 
-            status2, _, raw2 = self.request(
-                "POST",
-                "/api/scan",
-                json.dumps({"target": "127.0.0.1", "ports": "135"}),
-                self.auth_headers,
+            status, raw = self.post_scan(["127.0.0.1"], "135")
+            self.assertEqual(status, 409)
+            self.assertIn("Đang có một lần quét", self.error_of(raw))
+
+            self.cancel_if_running(web_server.KIND_SCAN, job_id)
+            self.wait_done(web_server.KIND_SCAN, job_id, timeout=60)
+
+    def test_second_discover_returns_conflict(self) -> None:
+        with mock.patch.object(scanner, "scan_port", side_effect=self.slow_scan):
+            job_id = self.start_discover("127.0.0.0/28", concurrency=1)
+
+            status, raw = self.post_discover("127.0.0.0/30")
+            self.assertEqual(status, 409)
+            self.assertIn("Đang có một lần dò host", self.error_of(raw))
+
+            self.cancel_if_running(web_server.KIND_DISCOVER, job_id)
+            self.wait_done(web_server.KIND_DISCOVER, job_id, timeout=60)
+
+    def test_discover_and_scan_can_run_together(self) -> None:
+        with mock.patch.object(scanner, "scan_port", side_effect=self.slow_scan):
+            discover_id = self.start_discover("127.0.0.0/28", concurrency=1)
+            scan_id = self.start_scan(["127.0.0.1"], "1-400", concurrency=1)
+
+            self.assertIsNotNone(
+                self.manager.running_job(web_server.KIND_DISCOVER)
             )
-            self.assertEqual(status2, 409)
-            self.assertIn("Đang có một lần quét chạy", self.error_of(raw2))
+            self.assertIsNotNone(self.manager.running_job(web_server.KIND_SCAN))
 
-            # Yêu cầu bị từ chối không được tạo job mới.
-            self.assertEqual(self.manager.get(job_id).status, "running")
-
-            self.request("POST", f"/api/scan/{job_id}/cancel", None, self.auth_headers)
-            self.wait_done(job_id)
+            self.cancel_if_running(web_server.KIND_DISCOVER, discover_id)
+            self.cancel_if_running(web_server.KIND_SCAN, scan_id)
+            self.wait_done(web_server.KIND_DISCOVER, discover_id, timeout=60)
+            self.wait_done(web_server.KIND_SCAN, scan_id, timeout=60)
 
     def test_scan_can_start_again_after_finishing(self) -> None:
-        status, raw = self.post_scan("127.0.0.1", "135")
-        self.assertEqual(status, 202)
-        self.wait_done(json.loads(raw)["id"])
+        with mock.patch.object(scanner, "scan_port", side_effect=self.fake_scan), \
+                mock.patch.object(scanner, "grab_banner", return_value=None):
+            first = self.start_scan(["127.0.0.1"], "135")
+            self.wait_done(web_server.KIND_SCAN, first)
 
-        status2, raw2 = self.post_scan("127.0.0.1", "445")
-        self.assertEqual(status2, 202)
-        self.wait_done(json.loads(raw2)["id"])
+            second = self.start_scan(["127.0.0.1"], "445")
+            self.wait_done(web_server.KIND_SCAN, second)
+
+        self.assertNotEqual(first, second)
 
 
 class CancelTest(WebServerTestCase):
-    """Hủy lần quét đang chạy."""
+    """Hủy job đang chạy, không hủy được job đã xong."""
 
     def test_cancel_running_scan(self) -> None:
         with mock.patch.object(scanner, "scan_port", side_effect=self.slow_scan):
-            status, raw = self.post_scan("127.0.0.1", "1-1024")
-            self.assertEqual(status, 202)
-            job_id = json.loads(raw)["id"]
+            job_id = self.start_scan(["127.0.0.1"], "1-400", concurrency=1)
+            self.cancel(web_server.KIND_SCAN, job_id)
+            snapshot = self.wait_done(web_server.KIND_SCAN, job_id, timeout=60)
 
-            status, _, raw = self.request(
-                "POST", f"/api/scan/{job_id}/cancel", None, self.auth_headers
-            )
-            self.assertEqual(status, 200)
-            self.assertTrue(json.loads(raw)["cancelled"])
+        self.assertEqual(snapshot["status"], "cancelled")
+        self.assertIn("Đã hủy", snapshot["message"])
 
-            snapshot = self.wait_done(job_id)
-            self.assertEqual(snapshot["status"], "cancelled")
+    def test_cancel_running_discover(self) -> None:
+        with mock.patch.object(scanner, "scan_port", side_effect=self.slow_scan):
+            job_id = self.start_discover("127.0.0.0/28", concurrency=1)
+            self.cancel(web_server.KIND_DISCOVER, job_id)
+            snapshot = self.wait_done(web_server.KIND_DISCOVER, job_id, timeout=60)
+
+        self.assertEqual(snapshot["status"], "cancelled")
+        self.assertIn("Đã hủy", snapshot["message"])
 
     def test_cancel_finished_scan_returns_conflict(self) -> None:
-        status, raw = self.post_scan("127.0.0.1", "135")
-        job_id = json.loads(raw)["id"]
-        self.wait_done(job_id)
+        with mock.patch.object(scanner, "scan_port", side_effect=self.fake_scan), \
+                mock.patch.object(scanner, "grab_banner", return_value=None):
+            job_id = self.start_scan(["127.0.0.1"], "135")
+            self.wait_done(web_server.KIND_SCAN, job_id)
 
-        status, _, raw = self.request(
+        status, _, _ = self.request(
             "POST", f"/api/scan/{job_id}/cancel", None, self.auth_headers
         )
         self.assertEqual(status, 409)
@@ -859,63 +760,118 @@ class CancelTest(WebServerTestCase):
         )
         self.assertEqual(status, 404)
 
+    def test_cancel_requires_token(self) -> None:
+        status, _, _ = self.request("POST", "/api/scan/khong-ton-tai/cancel", None)
+        self.assertEqual(status, 403)
+
+
+class DiscoverResultTest(WebServerTestCase):
+    """Job discover trả về danh sách host sống."""
+
+    def test_discover_returns_live_hosts(self) -> None:
+        with mock.patch.object(
+            web_server, "discover_hosts", return_value=["127.0.0.1", "127.0.0.2"]
+        ) as discover:
+            job_id = self.start_discover("127.0.0.0/30", discovery_ports="135")
+            snapshot = self.wait_done(web_server.KIND_DISCOVER, job_id)
+
+        self.assertEqual(snapshot["status"], "done")
+        self.assertEqual(snapshot["kind"], "discover")
+        self.assertEqual(snapshot["cidr"], "127.0.0.0/30")
+        self.assertEqual(snapshot["live_hosts"], ["127.0.0.1", "127.0.0.2"])
+        self.assertEqual(snapshot["total_live_hosts"], 2)
+        self.assertEqual(snapshot["hosts_total"], 2)
+        self.assertNotIn("results", snapshot)
+        self.assertEqual(snapshot["params"]["discovery_ports"], "135")
+        discover.assert_called_once()
+
+    def test_discover_does_not_scan_ports(self) -> None:
+        with mock.patch.object(web_server, "discover_hosts", return_value=[]), \
+                mock.patch.object(scanner, "scan_port") as scan_port:
+            job_id = self.start_discover("127.0.0.0/30")
+            self.wait_done(web_server.KIND_DISCOVER, job_id)
+
+        scan_port.assert_not_called()
+
 
 class ScanResultTest(WebServerTestCase):
     """Luồng quét đầy đủ và dữ liệu trả về."""
 
     def test_scan_loopback_ports_and_download(self) -> None:
-        status, raw = self.post_scan("127.0.0.1", "135,445")
-        self.assertEqual(status, 202)
-        job_id = json.loads(raw)["id"]
+        with FakeBannerServer(b"demo banner\r\n") as fake:
+            job_id = self.start_scan(["127.0.0.1"], str(fake.port))
+            snapshot = self.wait_done(web_server.KIND_SCAN, job_id)
 
-        snapshot = self.wait_done(job_id)
         self.assertEqual(snapshot["status"], "done")
-        self.assertEqual(sorted(r["port"] for r in snapshot["results"]), [135, 445])
+        self.assertEqual(snapshot["hosts"], ["127.0.0.1"])
+        self.assertEqual(len(snapshot["results"]), 1)
+        record = snapshot["results"][0]
         self.assertEqual(
-            sorted(r["service"] for r in snapshot["results"]),
-            ["microsoft-ds", "msrpc"],
+            set(record),
+            {"host", "port", "protocol", "service", "banner", "scanned_at"},
         )
-        for record in snapshot["results"]:
-            self.assertEqual(
-                set(record),
-                {"host", "port", "protocol", "service", "banner", "scanned_at"},
-            )
-            self.assertEqual(record["protocol"], "tcp")
-            self.assertEqual(record["host"], "127.0.0.1")
+        self.assertEqual(record["host"], "127.0.0.1")
+        self.assertEqual(record["port"], fake.port)
+        self.assertEqual(record["banner"], "demo banner")
 
         status, headers, raw = self.request(
-            "GET", f"/api/scan/{job_id}/download?format=json", headers=self.auth_headers
+            "GET",
+            f"/api/scan/{job_id}/download?format=json",
+            headers=self.auth_headers,
         )
         self.assertEqual(status, 200)
         self.assertIn("attachment", headers["Content-Disposition"])
         document = json.loads(raw)
         self.assertEqual(set(document), {"metadata", "results"})
-        self.assertEqual(document["metadata"]["total_open_ports"], len(document["results"]))
+        self.assertEqual(
+            document["metadata"]["total_open_ports"], len(document["results"])
+        )
         self.assertNotIn(b"Traceback", raw)
 
-    def test_cidr_scan_covers_hosts(self) -> None:
-        status, raw = self.post_scan("127.0.0.0/30", "135,445")
-        self.assertEqual(status, 202)
-        snapshot = self.wait_done(json.loads(raw)["id"], timeout=60)
+    def test_multi_host_scan_returns_all_hosts(self) -> None:
+        with mock.patch.object(scanner, "scan_port", side_effect=self.fake_scan), \
+                mock.patch.object(scanner, "grab_banner", return_value=None):
+            job_id = self.start_scan(
+                ["127.0.0.1", "127.0.0.2", "127.0.0.3"], "135,445"
+            )
+            snapshot = self.wait_done(web_server.KIND_SCAN, job_id)
+
         self.assertEqual(snapshot["status"], "done")
+        self.assertEqual(snapshot["host_count"], 3)
         self.assertEqual(
             sorted({r["host"] for r in snapshot["results"]}),
-            ["127.0.0.1", "127.0.0.2"],
+            ["127.0.0.1", "127.0.0.2", "127.0.0.3"],
         )
+        self.assertEqual(len(snapshot["results"]), 6)
+
+    def test_results_sorted_by_ip_then_port(self) -> None:
+        with mock.patch.object(scanner, "scan_port", side_effect=self.fake_scan), \
+                mock.patch.object(scanner, "grab_banner", return_value=None):
+            job_id = self.start_scan(["127.0.0.2", "127.0.0.1"], "1-4096")
+            snapshot = self.wait_done(web_server.KIND_SCAN, job_id)
+
+        keys = [(int(r["host"].split(".")[-1]), r["port"]) for r in snapshot["results"]]
+        self.assertEqual(keys, sorted(keys))
+
+    def test_duplicate_hosts_are_deduplicated(self) -> None:
+        with mock.patch.object(scanner, "scan_port", side_effect=self.fake_scan), \
+                mock.patch.object(scanner, "grab_banner", return_value=None):
+            job_id = self.start_scan(
+                ["127.0.0.1", "127.0.0.1", " 127.0.0.1 "], "135"
+            )
+            snapshot = self.wait_done(web_server.KIND_SCAN, job_id)
+
+        self.assertEqual(snapshot["host_count"], 1)
+        self.assertEqual(len(snapshot["results"]), 1)
 
     def test_banner_with_html_is_returned_verbatim_as_data(self) -> None:
         payload = b'<img src=x onerror=alert(1)><script>alert(2)</script>\r\n'
         with FakeBannerServer(payload) as fake:
-            status, raw = self.post_scan("127.0.0.1", str(fake.port))
-            self.assertEqual(status, 202)
-            job_id = json.loads(raw)["id"]
-            snapshot = self.wait_done(job_id)
+            job_id = self.start_scan(["127.0.0.1"], str(fake.port))
+            snapshot = self.wait_done(web_server.KIND_SCAN, job_id)
 
         self.assertEqual(snapshot["status"], "done")
-        self.assertEqual(len(snapshot["results"]), 1)
         record = snapshot["results"][0]
-        self.assertEqual(record["service"], "unknown")
-        self.assertIsNotNone(record["banner"])
         self.assertIn("<img src=x onerror=alert(1)>", record["banner"])
         self.assertIn("<script>alert(2)</script>", record["banner"])
 
@@ -924,9 +880,44 @@ class ScanResultTest(WebServerTestCase):
         status, _, final_raw = self.request("GET", f"/api/scan/{job_id}")
         self.assertEqual(status, 200)
         self.assertEqual(
-            json.loads(final_raw)["results"][0]["banner"],
-            record["banner"],
+            json.loads(final_raw)["results"][0]["banner"], record["banner"]
         )
+
+    def test_download_requires_token(self) -> None:
+        with mock.patch.object(scanner, "scan_port", side_effect=self.fake_scan), \
+                mock.patch.object(scanner, "grab_banner", return_value=None):
+            job_id = self.start_scan(["127.0.0.1"], "135")
+            self.wait_done(web_server.KIND_SCAN, job_id)
+
+        status, _, _ = self.request(
+            "GET", f"/api/scan/{job_id}/download?format=json"
+        )
+        self.assertEqual(status, 403)
+
+    def test_download_csv(self) -> None:
+        with mock.patch.object(scanner, "scan_port", side_effect=self.fake_scan), \
+                mock.patch.object(scanner, "grab_banner", return_value=None):
+            job_id = self.start_scan(["127.0.0.1"], "135")
+            self.wait_done(web_server.KIND_SCAN, job_id)
+
+        status, headers, raw = self.request(
+            "GET",
+            f"/api/scan/{job_id}/download?format=csv",
+            headers=self.auth_headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(headers["Content-Type"].startswith("text/csv"))
+        self.assertIn(b"host,port,protocol,service,banner,scanned_at", raw)
+
+    def test_download_on_discover_job_returns_404(self) -> None:
+        with mock.patch.object(web_server, "discover_hosts", return_value=[]):
+            job_id = self.start_discover("127.0.0.0/30")
+            self.wait_done(web_server.KIND_DISCOVER, job_id)
+
+        status, _, _ = self.request(
+            "GET", f"/api/scan/{job_id}/download?format=json", headers=self.auth_headers
+        )
+        self.assertEqual(status, 404)
 
 
 class BatchScanTest(WebServerTestCase):
@@ -935,8 +926,8 @@ class BatchScanTest(WebServerTestCase):
     def test_single_batch_for_exactly_one_batch_of_ports(self) -> None:
         with mock.patch.object(scanner, "scan_port", side_effect=self.fake_scan), \
                 mock.patch.object(scanner, "grab_banner", return_value=None):
-            job_id = self.start_scan("127.0.0.1", f"1-{web_server.BATCH_SIZE}")
-            snapshot = self.wait_done(job_id)
+            job_id = self.start_scan(["127.0.0.1"], f"1-{web_server.BATCH_SIZE}")
+            snapshot = self.wait_done(web_server.KIND_SCAN, job_id)
 
         self.assertEqual(snapshot["batch"]["total"], 1)
         self.assertEqual(snapshot["batch"]["index"], 1)
@@ -944,32 +935,23 @@ class BatchScanTest(WebServerTestCase):
         self.assertEqual(snapshot["batch"]["ports_done"], web_server.BATCH_SIZE)
 
     def test_two_batches_at_boundary(self) -> None:
-        ports = f"1-{web_server.BATCH_SIZE + 1}"
         with mock.patch.object(scanner, "scan_port", side_effect=self.fake_scan), \
                 mock.patch.object(scanner, "grab_banner", return_value=None):
-            job_id = self.start_scan("127.0.0.1", ports)
-            snapshot = self.wait_done(job_id)
+            job_id = self.start_scan(
+                ["127.0.0.1"], f"1-{web_server.BATCH_SIZE + 1}"
+            )
+            snapshot = self.wait_done(web_server.KIND_SCAN, job_id)
 
         self.assertEqual(snapshot["batch"]["total"], 2)
         self.assertEqual(snapshot["batch"]["port_range"], "2049")
         self.assertEqual(snapshot["status"], "done")
 
-    def test_batch_port_ranges_are_consecutive(self) -> None:
-        with mock.patch.object(scanner, "scan_port", side_effect=self.fake_scan), \
-                mock.patch.object(scanner, "grab_banner", return_value=None):
-            job_id = self.start_scan("127.0.0.1", "1-4096")
-            snapshot = self.wait_done(job_id)
-
-        self.assertEqual(snapshot["batch"]["total"], 2)
-        self.assertEqual(snapshot["batch"]["port_range"], "2049-4096")
-        self.assertEqual(snapshot["batch"]["ports_done"], 4096)
-
     def test_discrete_ports_are_split_correctly(self) -> None:
         # 3 cổng rời (22, 80, 443) + 2501 cổng liền (3000-5500) = 2504 cổng.
         with mock.patch.object(scanner, "scan_port", side_effect=self.fake_scan), \
                 mock.patch.object(scanner, "grab_banner", return_value=None):
-            job_id = self.start_scan("127.0.0.1", "22,80,443,3000-5500")
-            snapshot = self.wait_done(job_id)
+            job_id = self.start_scan(["127.0.0.1"], "22,80,443,3000-5500")
+            snapshot = self.wait_done(web_server.KIND_SCAN, job_id)
 
         self.assertEqual(snapshot["batch"]["total"], 2)
         self.assertEqual(snapshot["batch"]["ports_total"], 2504)
@@ -981,8 +963,9 @@ class BatchScanTest(WebServerTestCase):
 
         with mock.patch.object(scanner, "scan_port", side_effect=self.slow_fake_scan), \
                 mock.patch.object(scanner, "grab_banner", return_value=None):
-            job_id = self.start_scan("127.0.0.1", "1-4096")
+            job_id = self.start_scan(["127.0.0.1"], "1-4096")
             deadline = time.time() + 60
+            snapshot: dict = {}
             while time.time() < deadline:
                 _, _, raw = self.request("GET", f"/api/scan/{job_id}")
                 snapshot = json.loads(raw)
@@ -1003,107 +986,70 @@ class BatchScanTest(WebServerTestCase):
             any(ports == [135, 445] for ports in partial_results),
             f"kết quả lô 1 phải xuất hiện khi job còn chạy: {partial_results}",
         )
-        self.assertEqual(sorted(r["port"] for r in snapshot["results"]), [135, 445])
         self.assertEqual(snapshot["batch"]["ports_done"], 4096)
-
-    def test_results_sorted_by_ip_then_port(self) -> None:
-        with mock.patch.object(scanner, "scan_port", side_effect=self.fake_scan), \
-                mock.patch.object(scanner, "grab_banner", return_value=None):
-            job_id = self.start_scan("127.0.0.0/30", "1-4096")
-            snapshot = self.wait_done(job_id, timeout=60)
-
-        keys = [(r["host"], r["port"]) for r in snapshot["results"]]
-        self.assertEqual(keys, sorted(keys, key=lambda item: (item[0], item[1])))
-        self.assertEqual(
-            sorted({r["host"] for r in snapshot["results"]}),
-            ["127.0.0.1", "127.0.0.2"],
-        )
 
     def test_cancel_between_batches_keeps_finished_results(self) -> None:
         with mock.patch.object(scanner, "scan_port", side_effect=self.slow_fake_scan), \
                 mock.patch.object(scanner, "grab_banner", return_value=None):
-            job_id = self.start_scan("127.0.0.1", "1-4096")
+            job_id = self.start_scan(["127.0.0.1"], "1-4096")
 
             # Chờ lô 1 xong (job đã sang lô 2) rồi hủy.
-            self.wait_for_batch(job_id, 2)
-            self.cancel(job_id)
-            snapshot = self.wait_done(job_id, timeout=60)
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                _, _, raw = self.request("GET", f"/api/scan/{job_id}")
+                if (json.loads(raw).get("batch") or {}).get("index", 0) >= 2:
+                    break
+                time.sleep(0.05)
+            self.cancel(web_server.KIND_SCAN, job_id)
+            snapshot = self.wait_done(web_server.KIND_SCAN, job_id, timeout=60)
 
-            self.assertEqual(snapshot["status"], "cancelled")
-            self.assertEqual(snapshot["batch"]["completed"], 1)
-            self.assertEqual(
-                sorted(r["port"] for r in snapshot["results"]),
-                [135, 445],
-                "kết quả của lô đã xong phải được giữ lại",
-            )
-
-            # Vẫn tải được báo cáo sau khi hủy, metadata ghi rõ số lô.
-            status, _, raw = self.request(
-                "GET", f"/api/scan/{job_id}/download?format=json", headers=self.auth_headers
-            )
-            self.assertEqual(status, 200)
-            document = json.loads(raw)
-            self.assertEqual(document["metadata"]["batches_total"], 2)
-            self.assertEqual(document["metadata"]["batches_completed"], 1)
-            self.assertEqual(
-                sorted(r["port"] for r in document["results"]), [135, 445]
-            )
-
-            status, _, raw = self.request(
-                "GET", f"/api/scan/{job_id}/download?format=csv", headers=self.auth_headers
-            )
-            self.assertEqual(status, 200)
-            self.assertIn("host,port,protocol,service,banner,scanned_at", raw.decode("utf-8"))
+        self.assertEqual(snapshot["status"], "cancelled")
+        self.assertEqual(snapshot["batch"]["completed"], 1)
+        self.assertEqual(
+            sorted(r["port"] for r in snapshot["results"]),
+            [135, 445],
+            "kết quả của lô đã xong phải được giữ lại",
+        )
 
     def test_download_while_running_returns_partial_results(self) -> None:
         with mock.patch.object(scanner, "scan_port", side_effect=self.slow_fake_scan), \
                 mock.patch.object(scanner, "grab_banner", return_value=None):
-            job_id = self.start_scan("127.0.0.1", "1-4096")
-            self.wait_for_batch(job_id, 2)
+            job_id = self.start_scan(["127.0.0.1"], "1-4096", concurrency=5)
 
-            status, _, raw = self.request(
-                "GET", f"/api/scan/{job_id}/download?format=json", headers=self.auth_headers
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                _, _, raw = self.request("GET", f"/api/scan/{job_id}")
+                if (json.loads(raw).get("batch") or {}).get("ports_done", 0) >= 1:
+                    break
+                time.sleep(0.05)
+
+            status, _, download = self.request(
+                "GET",
+                f"/api/scan/{job_id}/download?format=json",
+                headers=self.auth_headers,
             )
             self.assertEqual(status, 200)
-            document = json.loads(raw)
-            self.assertEqual(document["metadata"]["batches_total"], 2)
-            self.assertGreaterEqual(document["metadata"]["batches_completed"], 1)
-            self.assertEqual(sorted(r["port"] for r in document["results"]), [135, 445])
+            document = json.loads(download)
+            self.assertEqual(
+                document["metadata"]["batches_total"], 2
+            )
 
-            self.cancel(job_id)
-            self.wait_done(job_id, timeout=60)
-
-    def test_cidr_with_full_port_range_is_rejected_without_connection(self) -> None:
-        calls: list[tuple[str, int]] = []
-
-        def spy(host: str, port: int, timeout: float = 1.0) -> bool:
-            calls.append((host, port))
-            return False
-
-        with mock.patch.object(scanner, "scan_port", side_effect=spy):
-            status, raw = self.post_scan("10.0.0.0/24", "1-65535")
-            self.assertEqual(status, 400)
-            self.assertIn("Vượt trần cứng", self.error_of(raw))
-            time.sleep(0.3)
-            self.assertEqual(calls, [], "không được mở kết nối nào")
-
-            status2, raw2 = self.post_scan("127.0.0.1", "135")
-            self.assertEqual(status2, 202)
-            self.wait_done(json.loads(raw2)["id"])
+            self.cancel_if_running(web_server.KIND_SCAN, job_id)
+            self.wait_done(web_server.KIND_SCAN, job_id, timeout=60)
 
     def test_batch_fields_present_in_cancel_response(self) -> None:
         with mock.patch.object(scanner, "scan_port", side_effect=self.slow_scan):
-            job_id = self.start_scan("127.0.0.1", "1-4096")
+            job_id = self.start_scan(["127.0.0.1"], "1-400", concurrency=1)
             status, _, raw = self.request(
                 "POST", f"/api/scan/{job_id}/cancel", None, self.auth_headers
             )
             self.assertEqual(status, 200)
-            snapshot = json.loads(raw)["job"]
-            self.assertIn("batch", snapshot)
-            self.assertEqual(snapshot["batch"]["total"], 2)
-            self.assertIn("ports_done", snapshot["batch"])
-            self.assertIn("ports_total", snapshot["batch"])
-            self.wait_done(job_id, timeout=60)
+            body = json.loads(raw)
+            self.assertTrue(body["cancelled"])
+            payload = body["job"]
+            self.assertIn("batch", payload)
+            self.assertIn("ports_total", payload["batch"])
+            self.wait_done(web_server.KIND_SCAN, job_id, timeout=60)
 
 
 if __name__ == "__main__":

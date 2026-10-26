@@ -1,5 +1,11 @@
 """Web server cục bộ hiển thị kết quả quét cổng.
 
+Hai giai đoạn là hai loại job độc lập, không job nào tự chuyển từ giai đoạn này
+sang giai đoạn kia:
+
+- job ``discover`` dò host sống trong một dải CIDR và trả về danh sách host;
+- job ``scan`` quét cổng trên một danh sách host do client chọn.
+
 Chỉ dùng thư viện chuẩn của Python. Server chỉ bind vào 127.0.0.1 và không có
 tham số nào để đổi điều này, vì nếu mở ra mạng LAN thì người khác có thể dùng
 máy của bạn để quét cổng.
@@ -56,12 +62,16 @@ DEFAULT_PORT = 8000
 # Token chống CSRF: sinh mỗi lần khởi động và bắt buộc với mọi request POST.
 TOKEN_HEADER = "X-Scan-Token"
 
+# Hai loại job độc lập.
+KIND_DISCOVER = "discover"
+KIND_SCAN = "scan"
+
 # Giới hạn phía server, không tin giá trị do trình duyệt gửi lên.
 MAX_PORTS = 65535
 # Kích thước một lô cổng: danh sách cổng được chia thành các lô liên tiếp cỡ này.
 BATCH_SIZE = 2048
-MAX_WORKERS = 100
-DEFAULT_WORKERS = 100
+MAX_CONCURRENCY = 100
+DEFAULT_CONCURRENCY = 100
 MAX_DISCOVERY_PORTS = 64
 MAX_BODY_BYTES = 65536
 KEEP_JOBS = 20
@@ -128,51 +138,22 @@ def sort_records(records: list[ScanRecord]) -> list[ScanRecord]:
     return sorted(records, key=key)
 
 
-class ScanJob:
-    """Trạng thái và kết quả của một lần quét chạy ở thread nền."""
+class BaseJob:
+    """Vòng đời chung của một job chạy ở thread nền."""
 
-    def __init__(
-        self,
-        target: ipaddress.IPv4Address | ipaddress.IPv4Network,
-        ports: list[int],
-        workers: int = DEFAULT_WORKERS,
-        timeout: float = DEFAULT_SCAN_TIMEOUT,
-        banner_timeout: float = DEFAULT_BANNER_TIMEOUT,
-        discovery_timeout: float = DEFAULT_DISCOVERY_TIMEOUT,
-        discovery_ports: tuple[int, ...] = DISCOVERY_PORTS,
-        confirmed_large_scan: bool = False,
-    ) -> None:
+    kind = ""
+
+    def __init__(self, confirmed_large_scan: bool = False) -> None:
         self.id = uuid.uuid4().hex
-        self.target = target
-        self.ports = list(ports)
-        # Tham số nâng cao đã được server kiểm tra, dùng cho cả job này.
-        self.workers = workers
-        self.timeout = timeout
-        self.banner_timeout = banner_timeout
-        self.discovery_timeout = discovery_timeout
-        self.discovery_ports = tuple(discovery_ports)
         self.confirmed_large_scan = confirmed_large_scan
-        # Chia lô ngay khi tạo job để snapshot đầu tiên đã có đủ thông tin lô.
-        self.batches = chunk_ports(self.ports)
         self.status = "running"
         self.phase = "starting"
-        self.done = 0
-        self.total = len(ports)
         self.message = "Đang khởi động..."
-        self.records: list[ScanRecord] = []
         self.errors: list[str] = []
         self.started_at = current_timestamp()
         self.finished_at: str | None = None
         self.cancel_event = threading.Event()
         self._lock = threading.Lock()
-        # Tiến độ theo lô: batch_index là lô đang chạy (1-based), ports_done là
-        # số cổng đã quét xong trên tổng số cổng của cả job.
-        self.batch_index = 0
-        self.batch_total = len(self.batches)
-        self.batch_port_range = ""
-        self.ports_total = len(self.ports)
-        self.ports_done = 0
-        self.batches_completed = 0
         self._started_monotonic = time.perf_counter()
         self._duration: float | None = None
 
@@ -192,6 +173,127 @@ class ScanJob:
         """Cập nhật dòng tiến độ hiển thị trên giao diện."""
         self.update(message=message, done=done, total=total, phase=phase)
 
+    def is_cancelled(self) -> bool:
+        return self.cancel_event.is_set()
+
+    def mark_finished(self, status: str, message: str) -> None:
+        """Chốt trạng thái cuối của job."""
+        with self._lock:
+            self.status = status
+            self.message = message
+            self.finished_at = current_timestamp()
+            self._duration = time.perf_counter() - self._started_monotonic
+
+    def _duration_seconds(self) -> float:
+        duration = self._duration
+        if duration is None:
+            duration = time.perf_counter() - self._started_monotonic
+        return duration
+
+    def _base_snapshot(self) -> dict:
+        return {
+            "id": self.id,
+            "kind": self.kind,
+            "status": self.status,
+            "phase": self.phase,
+            "message": self.message,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "duration_seconds": round(self._duration_seconds(), 3),
+            "errors": list(self.errors),
+        }
+
+    def snapshot(self) -> dict:
+        raise NotImplementedError
+
+
+class DiscoverJob(BaseJob):
+    """Một lần dò host sống trong một dải CIDR."""
+
+    kind = KIND_DISCOVER
+
+    def __init__(
+        self,
+        cidr: ipaddress.IPv4Network,
+        discovery_ports: tuple[int, ...] = DISCOVERY_PORTS,
+        discovery_timeout: float = DEFAULT_DISCOVERY_TIMEOUT,
+        concurrency: int = DEFAULT_CONCURRENCY,
+        confirmed_large_scan: bool = False,
+    ) -> None:
+        super().__init__(confirmed_large_scan=confirmed_large_scan)
+        self.cidr = cidr
+        self.discovery_ports = tuple(discovery_ports)
+        self.discovery_timeout = discovery_timeout
+        self.concurrency = concurrency
+        self.live_hosts: list[str] = []
+        self.hosts_total = count_target_hosts(cidr)
+        self.done = 0
+        self.total = self.hosts_total
+
+    def set_live_hosts(self, hosts: list[str]) -> None:
+        with self._lock:
+            self.live_hosts = list(hosts)
+
+    def live_hosts_snapshot(self) -> list[str]:
+        with self._lock:
+            return list(self.live_hosts)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            payload = self._base_snapshot()
+            payload.update(
+                {
+                    "cidr": str(self.cidr),
+                    "hosts_total": self.hosts_total,
+                    "live_hosts": list(self.live_hosts),
+                    "total_live_hosts": len(self.live_hosts),
+                    "progress": {"done": self.done, "total": self.total},
+                    "params": {
+                        "discovery_ports": format_port_spec(
+                            list(self.discovery_ports)
+                        ),
+                        "discovery_timeout": self.discovery_timeout,
+                        "concurrency": self.concurrency,
+                    },
+                }
+            )
+            return payload
+
+
+class ScanJob(BaseJob):
+    """Một lần quét cổng trên danh sách host đã biết."""
+
+    kind = KIND_SCAN
+
+    def __init__(
+        self,
+        hosts: list[ipaddress.IPv4Address],
+        ports: list[int],
+        concurrency: int = DEFAULT_CONCURRENCY,
+        timeout: float = DEFAULT_SCAN_TIMEOUT,
+        banner_timeout: float = DEFAULT_BANNER_TIMEOUT,
+        confirmed_large_scan: bool = False,
+    ) -> None:
+        super().__init__(confirmed_large_scan=confirmed_large_scan)
+        self.hosts = list(hosts)
+        self.ports = list(ports)
+        self.concurrency = concurrency
+        self.timeout = timeout
+        self.banner_timeout = banner_timeout
+        # Chia lô ngay khi tạo job để snapshot đầu tiên đã có đủ thông tin lô.
+        self.batches = chunk_ports(self.ports)
+        self.done = 0
+        self.total = len(self.ports)
+        self.records: list[ScanRecord] = []
+        # Tiến độ theo lô: batch_index là lô đang chạy (1-based), ports_done là
+        # số cổng đã quét xong trên tổng số cổng của cả job.
+        self.batch_index = 0
+        self.batch_total = len(self.batches)
+        self.batch_port_range = ""
+        self.ports_total = len(self.ports)
+        self.ports_done = 0
+        self.batches_completed = 0
+
     def add_records(self, records: list[ScanRecord]) -> None:
         with self._lock:
             self.records.extend(records)
@@ -204,16 +306,11 @@ class ScanJob:
         """Kết quả đã sắp xếp, dùng cho cả snapshot API lẫn file tải về."""
         return sort_records(self.records_snapshot())
 
-    def is_cancelled(self) -> bool:
-        return self.cancel_event.is_set()
-
-    def mark_finished(self, status: str, message: str) -> None:
-        """Chốt trạng thái cuối của lần quét."""
-        with self._lock:
-            self.status = status
-            self.message = message
-            self.finished_at = current_timestamp()
-            self._duration = time.perf_counter() - self._started_monotonic
+    def target_label(self) -> str:
+        """Nhãn mục tiêu dùng cho báo cáo và giao diện."""
+        if len(self.hosts) == 1:
+            return str(self.hosts[0])
+        return f"{len(self.hosts)} host"
 
     def report_metadata(self) -> dict:
         """Metadata của báo cáo, tính tại thời điểm gọi.
@@ -222,14 +319,12 @@ class ScanJob:
         đã hoàn thành luôn đúng với thời điểm tải.
         """
         with self._lock:
-            duration = self._duration
-            if duration is None:
-                duration = time.perf_counter() - self._started_monotonic
             return {
-                "target": str(self.target),
+                "target": self.target_label(),
+                "hosts_count": len(self.hosts),
                 "port_range": format_port_spec(self.ports),
                 "total_open_ports": len(self.records),
-                "scan_duration_seconds": round(duration, 3),
+                "scan_duration_seconds": round(self._duration_seconds(), 3),
                 "batches_completed": self.batches_completed,
                 "batches_total": self.batch_total,
             }
@@ -237,41 +332,35 @@ class ScanJob:
     def snapshot(self) -> dict:
         """Bản chụp trạng thái để trả về qua API JSON."""
         with self._lock:
-            payload = {
-                "id": self.id,
-                "target": str(self.target),
-                "ports": format_port_spec(self.ports),
-                "status": self.status,
-                "phase": self.phase,
-                "message": self.message,
-                # Giữ nguyên 'progress' cũ (tiến độ trong lô hiện tại) để không
-                # làm hỏng giao diện đang dùng.
-                "progress": {"done": self.done, "total": self.total},
-                "batch": {
-                    "index": self.batch_index,
-                    "total": self.batch_total,
-                    "completed": self.batches_completed,
-                    "port_range": self.batch_port_range,
-                    "ports_done": self.ports_done,
-                    "ports_total": self.ports_total,
-                },
-                "started_at": self.started_at,
-                "finished_at": self.finished_at,
-                "params": {
-                    "timeout": self.timeout,
-                    "banner_timeout": self.banner_timeout,
-                    "discovery_timeout": self.discovery_timeout,
-                    "discovery_ports": format_port_spec(list(self.discovery_ports)),
-                    "workers": self.workers,
-                },
-                "total_open_ports": len(self.records),
-                "results": list(self.records),
-                "errors": list(self.errors),
-                "downloads": {
-                    "json": f"/api/scan/{self.id}/download?format=json",
-                    "csv": f"/api/scan/{self.id}/download?format=csv",
-                },
-            }
+            payload = self._base_snapshot()
+            payload.update(
+                {
+                    "target": self.target_label(),
+                    "hosts": [str(host) for host in self.hosts],
+                    "host_count": len(self.hosts),
+                    "ports": format_port_spec(self.ports),
+                    "progress": {"done": self.done, "total": self.total},
+                    "batch": {
+                        "index": self.batch_index,
+                        "total": self.batch_total,
+                        "completed": self.batches_completed,
+                        "port_range": self.batch_port_range,
+                        "ports_done": self.ports_done,
+                        "ports_total": self.ports_total,
+                    },
+                    "params": {
+                        "timeout": self.timeout,
+                        "banner_timeout": self.banner_timeout,
+                        "concurrency": self.concurrency,
+                    },
+                    "total_open_ports": len(self.records),
+                    "results": list(self.records),
+                    "downloads": {
+                        "json": f"/api/scan/{self.id}/download?format=json",
+                        "csv": f"/api/scan/{self.id}/download?format=csv",
+                    },
+                }
+            )
         # Sắp xếp ngoài lock để không giữ lock lâu khi có nhiều kết quả.
         payload["results"] = [
             asdict(record) for record in sort_records(payload["results"])
@@ -279,85 +368,56 @@ class ScanJob:
         return payload
 
 
-def finish_job(job: ScanJob, status: str, message: str) -> None:
-    """Chốt trạng thái cuối của lần quét."""
+def finish_job(job: BaseJob, status: str, message: str) -> None:
+    """Chốt trạng thái cuối của job."""
     job.mark_finished(status, message)
 
 
-def run_scan(job: ScanJob) -> None:
-    """Chạy quét trong thread nền, chia cổng thành từng lô.
+def run_discover(job: DiscoverJob) -> None:
+    """Chạy giai đoạn dò host sống trong thread nền; không quét cổng."""
+    hosts = [str(host) for host in job.cidr.hosts()]
 
-    Tái sử dụng logic trong scanner.py: dò host sống cho CIDR đúng MỘT lần ở
-    đầu, rồi với mỗi lô cổng thì quét lô đó trên tất cả host sống. Kết quả được
-    gộp vào job ngay sau mỗi lô, nên API polling trả về được kết quả từng phần.
+    def on_progress(done: int, total: int, host: str, alive: bool) -> None:
+        status = "sống" if alive else "không phản hồi"
+        job.progress(f"[{done}/{total}] {host}: {status}", done, total, "discovery")
+
+    try:
+        live_hosts = discover_hosts(
+            hosts,
+            ports=job.discovery_ports,
+            timeout=job.discovery_timeout,
+            workers=job.concurrency,
+            on_progress=on_progress,
+            should_cancel=job.is_cancelled,
+        )
+
+        if job.is_cancelled():
+            job.set_live_hosts(live_hosts)
+            finish_job(job, "cancelled", "Đã hủy dò host.")
+            return
+
+        job.set_live_hosts(live_hosts)
+        finish_job(
+            job,
+            "done",
+            f"Hoàn tất: {len(live_hosts)}/{len(hosts)} host sống.",
+        )
+    except Exception as exc:  # noqa: BLE001 - không để lộ traceback ra trình duyệt
+        finish_job(job, "error", f"Lỗi khi dò host: {exc}")
+
+
+def run_scan(job: ScanJob) -> None:
+    """Chạy quét cổng trên danh sách host đã biết, chia cổng thành từng lô.
+
+    Không dò host sống ở đây: danh sách host do client chọn từ kết quả của một
+    job discover trước đó (hoặc một IP đơn).
     """
     errors: list[str] = []
     batches = job.batches
-    workers = job.workers
+    workers = job.concurrency
+    targets = [str(host) for host in job.hosts]
 
     try:
-        targets = [str(job.target)]
-
-        if isinstance(job.target, ipaddress.IPv4Network):
-            hosts = [str(host) for host in job.target.hosts()]
-            job.progress(
-                f"Đang dò host sống trong {job.target} ({len(hosts)} host)...",
-                0,
-                len(hosts),
-                "discovery",
-            )
-
-            def on_discovery(done: int, total: int, host: str, alive: bool) -> None:
-                status = "sống" if alive else "không phản hồi"
-                job.progress(f"[{done}/{total}] {host}: {status}", done, total, "discovery")
-
-            targets = discover_hosts(
-                hosts,
-                ports=job.discovery_ports,
-                timeout=job.discovery_timeout,
-                workers=workers,
-                on_progress=on_discovery,
-                should_cancel=job.is_cancelled,
-            )
-
-            if job.is_cancelled():
-                finish_job(job, "cancelled", "Đã hủy quét.")
-                return
-            if not targets:
-                finish_job(
-                    job,
-                    "done",
-                    "Không tìm thấy host nào phản hồi nên bỏ qua quét cổng.",
-                )
-                return
-
-            # Kiểm tra thật giai đoạn quét cổng bằng số host sống thực tế. Đây là
-            # phép so sánh độc lập của giai đoạn quét, không cộng lượt dò host.
-            attempts = estimate_stage_attempts(len(targets), len(job.ports))
-            if attempts > HARD_ATTEMPTS:
-                finish_job(
-                    job,
-                    "error",
-                    "Sau khi dò host sống: "
-                    f"{len(targets)} host sống × {len(job.ports)} cổng = "
-                    f"{format_attempts(attempts)} lượt, vượt trần cứng "
-                    f"{format_attempts(HARD_ATTEMPTS)} ở "
-                    f"{STAGE_LABELS[STAGE_SCAN]}. Dừng trước khi quét cổng.",
-                )
-                return
-            if attempts > WARN_ATTEMPTS and not job.confirmed_large_scan:
-                finish_job(
-                    job,
-                    "error",
-                    "Sau khi dò host sống: "
-                    f"{len(targets)} host sống × {len(job.ports)} cổng = "
-                    f"{format_attempts(attempts)} lượt, vượt mốc "
-                    f"{format_attempts(WARN_ATTEMPTS)} ở "
-                    f"{STAGE_LABELS[STAGE_SCAN]}. Hãy chạy lại và xác nhận "
-                    "quét lớn, hoặc giảm số cổng / thu nhỏ dải CIDR.",
-                )
-                return
-
         host_count = len(targets)
         completed_ports = 0
 
@@ -451,47 +511,92 @@ def run_scan(job: ScanJob) -> None:
         finish_job(job, "error", f"Lỗi khi quét: {exc}")
 
 
-class ScanManager:
-    """Giữ các lần quét và bảo đảm mỗi lúc chỉ có một lần quét chạy."""
+class JobManager:
+    """Giữ các job; mỗi loại (discover/scan) chỉ cho một job chạy tại một thời điểm.
+
+    Hai loại độc lập nên có thể chạy đồng thời một job discover và một job scan.
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._jobs: dict[str, ScanJob] = {}
+        self._jobs: dict[str, BaseJob] = {}
         self._order: list[str] = []
 
-    def start(
+    def _running_of_kind(self, kind: str) -> BaseJob | None:
+        for job in self._jobs.values():
+            if job.kind == kind and job.status == "running":
+                return job
+        return None
+
+    def _conflict_message(self, kind: str) -> str:
+        if kind == KIND_DISCOVER:
+            return (
+                "Đang có một lần dò host chạy. Hãy đợi hoặc hủy lần dò đó trước."
+            )
+        return "Đang có một lần quét chạy. Hãy đợi hoặc hủy lần quét đó trước."
+
+    def _register(self, job: BaseJob) -> None:
+        self._jobs[job.id] = job
+        self._order.append(job.id)
+        while len(self._order) > KEEP_JOBS:
+            stale = self._order.pop(0)
+            stale_job = self._jobs.get(stale)
+            if stale_job is not None and stale_job.status == "running":
+                # Không bỏ job đang chạy; đẩy id về cuối hàng đợi.
+                self._order.append(stale)
+                break
+            self._jobs.pop(stale, None)
+
+    def start_discover(
         self,
-        target: ipaddress.IPv4Address | ipaddress.IPv4Network,
+        cidr: ipaddress.IPv4Network,
+        discovery_ports: tuple[int, ...] = DISCOVERY_PORTS,
+        discovery_timeout: float = DEFAULT_DISCOVERY_TIMEOUT,
+        concurrency: int = DEFAULT_CONCURRENCY,
+        confirmed_large_scan: bool = False,
+    ) -> DiscoverJob:
+        with self._lock:
+            if self._running_of_kind(KIND_DISCOVER) is not None:
+                raise ApiError(409, self._conflict_message(KIND_DISCOVER))
+            job = DiscoverJob(
+                cidr,
+                discovery_ports=discovery_ports,
+                discovery_timeout=discovery_timeout,
+                concurrency=concurrency,
+                confirmed_large_scan=confirmed_large_scan,
+            )
+            self._register(job)
+
+        thread = threading.Thread(
+            target=run_discover,
+            args=(job,),
+            name=f"discover-{job.id[:8]}",
+            daemon=True,
+        )
+        thread.start()
+        return job
+
+    def start_scan(
+        self,
+        hosts: list[ipaddress.IPv4Address],
         ports: list[int],
-        workers: int = DEFAULT_WORKERS,
+        concurrency: int = DEFAULT_CONCURRENCY,
         timeout: float = DEFAULT_SCAN_TIMEOUT,
         banner_timeout: float = DEFAULT_BANNER_TIMEOUT,
-        discovery_timeout: float = DEFAULT_DISCOVERY_TIMEOUT,
-        discovery_ports: tuple[int, ...] = DISCOVERY_PORTS,
         confirmed_large_scan: bool = False,
     ) -> ScanJob:
         with self._lock:
-            for existing in self._jobs.values():
-                if existing.status == "running":
-                    raise ApiError(
-                        409,
-                        "Đang có một lần quét chạy. Hãy đợi hoặc hủy lần quét đó trước.",
-                    )
+            if self._running_of_kind(KIND_SCAN) is not None:
+                raise ApiError(409, self._conflict_message(KIND_SCAN))
             job = ScanJob(
-                target,
+                hosts,
                 ports,
-                workers=workers,
+                concurrency=concurrency,
                 timeout=timeout,
                 banner_timeout=banner_timeout,
-                discovery_timeout=discovery_timeout,
-                discovery_ports=discovery_ports,
                 confirmed_large_scan=confirmed_large_scan,
             )
-            self._jobs[job.id] = job
-            self._order.append(job.id)
-            while len(self._order) > KEEP_JOBS:
-                stale = self._order.pop(0)
-                self._jobs.pop(stale, None)
+            self._register(job)
 
         thread = threading.Thread(
             target=run_scan,
@@ -502,26 +607,37 @@ class ScanManager:
         thread.start()
         return job
 
-    def get(self, job_id: str) -> ScanJob | None:
+    def get(self, job_id: str) -> BaseJob | None:
         with self._lock:
             return self._jobs.get(job_id)
 
-    def running_job(self) -> ScanJob | None:
-        """Job đang chạy, nếu có (dùng cho kiểm thử và chẩn đoán)."""
-        with self._lock:
-            for job in self._jobs.values():
-                if job.status == "running":
-                    return job
-        return None
-
-    def cancel(self, job_id: str) -> ScanJob:
+    def require(self, job_id: str, kind: str) -> BaseJob:
+        """Lấy job theo id và đúng loại, nếu không thì 404."""
         job = self.get(job_id)
-        if job is None:
+        if job is None or job.kind != kind:
+            if kind == KIND_DISCOVER:
+                raise ApiError(404, "Không tìm thấy lần dò host này.")
             raise ApiError(404, "Không tìm thấy lần quét này.")
+        return job
+
+    def running_job(self, kind: str | None = None) -> BaseJob | None:
+        """Job đang chạy theo loại (hoặc bất kỳ), dùng cho kiểm thử/chẩn đoán."""
+        with self._lock:
+            if kind is None:
+                for job in self._jobs.values():
+                    if job.status == "running":
+                        return job
+                return None
+            return self._running_of_kind(kind)
+
+    def cancel(self, job_id: str, kind: str) -> BaseJob:
+        job = self.require(job_id, kind)
         if job.status != "running":
+            if kind == KIND_DISCOVER:
+                raise ApiError(409, "Lần dò host này đã kết thúc nên không thể hủy.")
             raise ApiError(409, "Lần quét này đã kết thúc nên không thể hủy.")
         job.cancel_event.set()
-        job.update(message="Đang hủy quét...")
+        job.update(message="Đang hủy...")
         return job
 
 
@@ -564,13 +680,16 @@ def _optional_timeout(
     return number
 
 
-def _optional_workers(data: dict) -> int:
-    """Đọc số luồng từ JSON và kiểm tra giới hạn phía server."""
-    value = data.get("workers", DEFAULT_WORKERS)
+def _optional_concurrency(data: dict) -> int:
+    """Đọc số luồng (concurrency) từ JSON và kiểm tra giới hạn phía server."""
+    value = data.get("concurrency", DEFAULT_CONCURRENCY)
     if isinstance(value, bool) or not isinstance(value, int):
-        raise ApiError(400, "Trường 'workers' phải là số nguyên.")
-    if not 1 <= value <= MAX_WORKERS:
-        raise ApiError(400, f"Trường 'workers' phải trong khoảng 1-{MAX_WORKERS}.")
+        raise ApiError(400, "Trường 'concurrency' phải là số nguyên.")
+    if not 1 <= value <= MAX_CONCURRENCY:
+        raise ApiError(
+            400,
+            f"Trường 'concurrency' phải trong khoảng 1-{MAX_CONCURRENCY}.",
+        )
     return value
 
 
@@ -597,6 +716,44 @@ def _optional_discovery_ports(data: dict) -> tuple[int, ...]:
             f"(yêu cầu {len(ports)}).",
         )
     return tuple(ports)
+
+
+def _stage_estimate(
+    stage: str,
+    hosts: int,
+    ports_count: int,
+    seconds: float,
+) -> dict:
+    """Ước tính của một giai đoạn, dùng cho payload xác nhận quét lớn."""
+    return {
+        "stage": stage,
+        "label": STAGE_LABELS[stage],
+        "hosts": hosts,
+        "ports": ports_count,
+        "attempts": estimate_stage_attempts(hosts, ports_count),
+        "seconds": round(seconds, 1),
+        "duration": format_duration(seconds),
+    }
+
+
+def _confirmation_payload(info: dict) -> dict:
+    """Payload 202 khi một giai đoạn vượt mốc cảnh báo."""
+    return {
+        "confirmation_required": True,
+        "reason": "large_scan",
+        "message": " ".join(
+            stage_warning_lines(info["stage"], info["attempts"], info["seconds"])
+        ),
+        "stages": [info["stage"]],
+        "estimates": {
+            STAGE_DISCOVERY: (
+                info if info["stage"] == STAGE_DISCOVERY else None
+            ),
+            STAGE_SCAN: info if info["stage"] == STAGE_SCAN else None,
+        },
+        "warn_threshold": WARN_ATTEMPTS,
+        "hard_threshold": HARD_ATTEMPTS,
+    }
 
 
 class ScanRequestHandler(BaseHTTPRequestHandler):
@@ -725,16 +882,20 @@ class ScanRequestHandler(BaseHTTPRequestHandler):
             return
 
         parts = [segment for segment in parsed.path.split("/") if segment]
-        if len(parts) >= 3 and parts[0] == "api" and parts[1] == "scan":
-            job = self.server.manager.get(parts[2])
-            if job is None:
-                raise ApiError(404, "Không tìm thấy lần quét này.")
-            if len(parts) == 3:
-                self._send_json(200, job.snapshot())
-                return
-            if len(parts) == 4 and parts[3] == "download":
-                self._handle_download(job, parsed.query)
-                return
+        if len(parts) >= 3 and parts[0] == "api":
+            if parts[1] == KIND_DISCOVER:
+                job = self.server.manager.require(parts[2], KIND_DISCOVER)
+                if len(parts) == 3:
+                    self._send_json(200, job.snapshot())
+                    return
+            elif parts[1] == KIND_SCAN:
+                job = self.server.manager.require(parts[2], KIND_SCAN)
+                if len(parts) == 3:
+                    self._send_json(200, job.snapshot())
+                    return
+                if len(parts) == 4 and parts[3] == "download":
+                    self._handle_download(job, parsed.query)
+                    return
 
         raise ApiError(404, "Không tìm thấy tài nguyên.")
 
@@ -786,38 +947,144 @@ class ScanRequestHandler(BaseHTTPRequestHandler):
 
         parts = [segment for segment in urlparse(self.path).path.split("/") if segment]
 
-        if parts == ["api", "scan"]:
+        if parts == ["api", KIND_DISCOVER]:
+            self._start_discover(raw_body)
+            return
+        if parts == ["api", KIND_SCAN]:
             self._start_scan(raw_body)
             return
-        if len(parts) == 4 and parts[:2] == ["api", "scan"] and parts[3] == "cancel":
-            job = self.server.manager.cancel(parts[2])
-            self._send_json(200, {"cancelled": True, "job": job.snapshot()})
-            return
+
+        if len(parts) == 4 and parts[0] == "api" and parts[3] == "cancel":
+            if parts[1] == KIND_DISCOVER:
+                job = self.server.manager.cancel(parts[2], KIND_DISCOVER)
+                self._send_json(200, {"cancelled": True, "job": job.snapshot()})
+                return
+            if parts[1] == KIND_SCAN:
+                job = self.server.manager.cancel(parts[2], KIND_SCAN)
+                self._send_json(200, {"cancelled": True, "job": job.snapshot()})
+                return
 
         raise ApiError(404, "Không tìm thấy tài nguyên.")
+
+    def _start_discover(self, raw_body: bytes) -> None:
+        data = _parse_json_object(raw_body)
+
+        cidr_raw = data.get("cidr")
+        if not isinstance(cidr_raw, str) or not cidr_raw.strip():
+            raise ApiError(
+                400,
+                "Thiếu trường 'cidr' (chuỗi CIDR, ví dụ \"192.168.1.0/24\").",
+            )
+
+        try:
+            network = parse_target(cidr_raw.strip())
+        except argparse.ArgumentTypeError as exc:
+            raise ApiError(400, str(exc)) from exc
+        if not isinstance(network, ipaddress.IPv4Network):
+            raise ApiError(
+                400,
+                "Trường 'cidr' phải là một dải CIDR, không nhận một IP đơn; "
+                "quét một IP thì gọi /api/scan với hosts.",
+            )
+        if not is_internal(network):
+            raise ApiError(
+                403,
+                "Chỉ cho phép dò host trong dải IP nội bộ "
+                "(10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8).",
+            )
+
+        discovery_ports = _optional_discovery_ports(data)
+        discovery_timeout = _optional_timeout(
+            data, "discovery_timeout", DEFAULT_DISCOVERY_TIMEOUT
+        )
+        concurrency = _optional_concurrency(data)
+        confirmed = _optional_bool(data, "confirm")
+
+        max_hosts = count_target_hosts(network)
+        attempts = estimate_stage_attempts(max_hosts, len(discovery_ports))
+        seconds = estimate_stage_seconds(
+            max_hosts, len(discovery_ports), discovery_timeout, concurrency
+        )
+
+        if attempts > HARD_ATTEMPTS:
+            raise ApiError(
+                400,
+                stage_limit_message(
+                    STAGE_DISCOVERY, max_hosts, len(discovery_ports)
+                ),
+            )
+
+        if attempts > WARN_ATTEMPTS and not confirmed:
+            info = _stage_estimate(
+                STAGE_DISCOVERY, max_hosts, len(discovery_ports), seconds
+            )
+            self._send_json(202, _confirmation_payload(info))
+            return
+
+        job = self.server.manager.start_discover(
+            network,
+            discovery_ports=discovery_ports,
+            discovery_timeout=discovery_timeout,
+            concurrency=concurrency,
+            confirmed_large_scan=confirmed,
+        )
+        self._send_json(202, job.snapshot())
 
     def _start_scan(self, raw_body: bytes) -> None:
         data = _parse_json_object(raw_body)
 
-        target_raw = data.get("target")
-        ports_raw = data.get("ports")
-        if not isinstance(target_raw, str) or not target_raw.strip():
-            raise ApiError(400, "Thiếu trường 'target' (chuỗi IP hoặc CIDR).")
-        if not isinstance(ports_raw, str) or not ports_raw.strip():
-            raise ApiError(400, "Thiếu trường 'ports' (chuỗi dải cổng, ví dụ 1-1024).")
-
-        # Kiểm tra phía server, không tin giao diện.
-        try:
-            target = parse_target(target_raw.strip())
-        except argparse.ArgumentTypeError as exc:
-            raise ApiError(400, str(exc)) from exc
-        if not is_internal(target):
+        if data.get("target") is not None or data.get("cidr") is not None:
             raise ApiError(
-                403,
-                "Chỉ cho phép quét mục tiêu trong dải IP nội bộ "
-                "(10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8).",
+                400,
+                "POST /api/scan chỉ nhận 'hosts' (danh sách IPv4). Muốn quét "
+                "theo CIDR, hãy gọi /api/discover trước rồi dùng danh sách "
+                "live_hosts trả về.",
             )
 
+        hosts_raw = data.get("hosts")
+        if not isinstance(hosts_raw, list):
+            raise ApiError(
+                400,
+                "Thiếu trường 'hosts' (danh sách IPv4, ví dụ [\"127.0.0.1\"]).",
+            )
+        if not hosts_raw:
+            raise ApiError(400, "Trường 'hosts' không được rỗng.")
+
+        hosts: list[ipaddress.IPv4Address] = []
+        for entry in hosts_raw:
+            if not isinstance(entry, str):
+                raise ApiError(
+                    400, "Mỗi phần tử trong 'hosts' phải là chuỗi IPv4."
+                )
+            text = entry.strip()
+            if "/" in text:
+                raise ApiError(
+                    400,
+                    "Trường 'hosts' chỉ nhận địa chỉ IPv4, không nhận CIDR; "
+                    "hãy gọi /api/discover trước.",
+                )
+            try:
+                host = ipaddress.ip_address(text)
+            except ValueError as exc:
+                raise ApiError(
+                    400, f"Địa chỉ trong 'hosts' không hợp lệ: {text!r}."
+                ) from exc
+            if host.version != 4:
+                raise ApiError(400, "Hiện chỉ hỗ trợ địa chỉ IPv4.")
+            if not is_internal(host):
+                raise ApiError(
+                    403,
+                    f"Host ngoài dải nội bộ bị từ chối: {host}. Chỉ cho phép "
+                    "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8.",
+                )
+            hosts.append(host)
+        hosts = list(dict.fromkeys(hosts))
+
+        ports_raw = data.get("ports")
+        if not isinstance(ports_raw, str) or not ports_raw.strip():
+            raise ApiError(
+                400, "Thiếu trường 'ports' (chuỗi dải cổng, ví dụ 1-1024)."
+            )
         try:
             ports = parse_ports(ports_raw.strip())
         except argparse.ArgumentTypeError as exc:
@@ -831,101 +1098,35 @@ class ScanRequestHandler(BaseHTTPRequestHandler):
             )
 
         # Các tham số nâng cao, luôn được kiểm tra lại phía server.
-        workers = _optional_workers(data)
+        concurrency = _optional_concurrency(data)
         timeout = _optional_timeout(data, "timeout", DEFAULT_SCAN_TIMEOUT)
         banner_timeout = _optional_timeout(
             data, "banner_timeout", DEFAULT_BANNER_TIMEOUT
         )
-        discovery_timeout = _optional_timeout(
-            data, "discovery_timeout", DEFAULT_DISCOVERY_TIMEOUT
-        )
-        discovery_ports = _optional_discovery_ports(data)
         confirmed = _optional_bool(data, "confirm")
 
-        # Mỗi giai đoạn được đánh giá ĐỘC LẬP: không cộng lượt dò host với lượt
-        # quét cổng để so với một trần chung.
-        is_network = isinstance(target, ipaddress.IPv4Network)
-        max_hosts = count_target_hosts(target)
-
-        estimates: dict[str, dict] = {}
-        if is_network:
-            discovery_count = len(discovery_ports)
-            discovery_seconds = estimate_stage_seconds(
-                max_hosts, discovery_count, discovery_timeout, workers
-            )
-            estimates[STAGE_DISCOVERY] = {
-                "stage": STAGE_DISCOVERY,
-                "label": STAGE_LABELS[STAGE_DISCOVERY],
-                "hosts": max_hosts,
-                "ports": discovery_count,
-                "attempts": estimate_stage_attempts(max_hosts, discovery_count),
-                "seconds": round(discovery_seconds, 1),
-                "duration": format_duration(discovery_seconds),
-            }
-
-        scan_seconds = estimate_stage_seconds(
-            max_hosts, len(ports), timeout, workers
+        # Giới hạn của giai đoạn quét dùng SỐ HOST THẬT trong danh sách.
+        attempts = estimate_stage_attempts(len(hosts), len(ports))
+        seconds = estimate_stage_seconds(
+            len(hosts), len(ports), timeout, concurrency
         )
-        estimates[STAGE_SCAN] = {
-            "stage": STAGE_SCAN,
-            "label": STAGE_LABELS[STAGE_SCAN],
-            "hosts": max_hosts,
-            "ports": len(ports),
-            "attempts": estimate_stage_attempts(max_hosts, len(ports)),
-            "seconds": round(scan_seconds, 1),
-            "duration": format_duration(scan_seconds),
-        }
 
-        # Trần cứng: giai đoạn nào vượt thì từ chối ngay và nêu rõ giai đoạn đó.
-        for stage in (STAGE_DISCOVERY, STAGE_SCAN):
-            info = estimates.get(stage)
-            if info is None or info["attempts"] <= HARD_ATTEMPTS:
-                continue
+        if attempts > HARD_ATTEMPTS:
             raise ApiError(
-                400,
-                stage_limit_message(stage, info["hosts"], info["ports"]),
+                400, stage_limit_message(STAGE_SCAN, len(hosts), len(ports))
             )
 
-        # Mốc cảnh báo: trả về bước xác nhận riêng, chỉ nêu các giai đoạn vượt
-        # mốc. Giai đoạn vượt trần cứng đã bị từ chối ở trên nên không tới đây.
-        over_warning = [
-            info
-            for info in estimates.values()
-            if info["attempts"] > WARN_ATTEMPTS
-        ]
-        if over_warning and not confirmed:
-            lines: list[str] = []
-            for info in over_warning:
-                lines.extend(
-                    stage_warning_lines(
-                        info["stage"], info["attempts"], info["seconds"]
-                    )
-                )
-            self._send_json(
-                202,
-                {
-                    "confirmation_required": True,
-                    "reason": "large_scan",
-                    "message": " ".join(lines),
-                    "stages": [info["stage"] for info in over_warning],
-                    "estimates": {
-                        STAGE_DISCOVERY: estimates.get(STAGE_DISCOVERY),
-                        STAGE_SCAN: estimates[STAGE_SCAN],
-                    },
-                    "warn_threshold": WARN_ATTEMPTS,
-                    "hard_threshold": HARD_ATTEMPTS,
-                },
-            )
+        if attempts > WARN_ATTEMPTS and not confirmed:
+            info = _stage_estimate(STAGE_SCAN, len(hosts), len(ports), seconds)
+            self._send_json(202, _confirmation_payload(info))
             return
 
-        job = self.server.manager.start(
-            target,
+        job = self.server.manager.start_scan(
+            hosts,
             ports,
-            workers=workers,
+            concurrency=concurrency,
             timeout=timeout,
             banner_timeout=banner_timeout,
-            discovery_timeout=discovery_timeout,
-            discovery_ports=discovery_ports,
             confirmed_large_scan=confirmed,
         )
         self._send_json(202, job.snapshot())
@@ -942,7 +1143,7 @@ class WebServer(ThreadingHTTPServer):
         address: tuple[str, int],
         handler: type[ScanRequestHandler],
         token: str,
-        manager: ScanManager,
+        manager: JobManager,
         index_html: bytes,
     ) -> None:
         super().__init__(address, handler)
@@ -1018,7 +1219,7 @@ def main() -> int:
 
     token = secrets.token_urlsafe(32)
     index_html = load_index_html(token)
-    manager = ScanManager()
+    manager = JobManager()
 
     try:
         server = WebServer(
@@ -1037,10 +1238,10 @@ def main() -> int:
     print(f"Chỉ lắng nghe trên {BIND_HOST}:{server.server_port} (không vào được từ mạng LAN).")
     print(
         f"Giới hạn: tối đa {MAX_PORTS} cổng mỗi lần quét, chia thành các lô "
-        f"{BATCH_SIZE} cổng; giai đoạn dò host và giai đoạn quét cổng được đánh "
-        f"giá độc lập: cảnh báo khi vượt {format_attempts(WARN_ATTEMPTS)} lượt "
-        f"và từ chối khi vượt {format_attempts(HARD_ATTEMPTS)} lượt mỗi giai "
-        "đoạn; chỉ mục tiêu trong dải nội bộ."
+        f"{BATCH_SIZE} cổng; job discover và job scan độc lập, mỗi loại chỉ một "
+        f"job tại một thời điểm; cảnh báo khi vượt {format_attempts(WARN_ATTEMPTS)} "
+        f"lượt và từ chối khi vượt {format_attempts(HARD_ATTEMPTS)} lượt mỗi "
+        "giai đoạn; chỉ mục tiêu trong dải nội bộ."
     )
     print("Nhấn Ctrl+C để dừng.")
 
