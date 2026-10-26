@@ -198,6 +198,8 @@
     margin-bottom: 12px;
   }
   .results-head .tools { display: flex; gap: 8px; flex-wrap: wrap; }
+  .results-title { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  #scan-params { margin: 0; }
 
   .badge {
     padding: 2px 8px;
@@ -286,7 +288,7 @@
           <div class="field prefix-field">
             <label for="prefix">CIDR, tùy chọn</label>
             <input id="prefix" name="prefix" type="number" min="24" max="32" step="1"
-                   placeholder="24" inputmode="numeric" autocomplete="off"
+                   placeholder="vd: 24" inputmode="numeric" autocomplete="off"
                    aria-describedby="ip-error cidr-preview">
           </div>
         </div>
@@ -312,10 +314,8 @@
       </div>
     </form>
     <p class="hint">
-      Ví dụ: IP <code>127.0.0.1</code> và để trống prefix (quét một máy), hoặc IP
-      <code>192.168.1.10</code> với prefix <code>24</code> (quét cả dải, được chuẩn hóa
-      thành <code>192.168.1.0/24</code>). Ví dụ dải cổng: <code>1-1024</code>,
-      <code>22,80,443</code>.
+      Để trống prefix để quét một máy; điền prefix để quét cả dải. Dải cổng ví dụ:
+      <code>1-1024</code> hoặc <code>22,80,443</code>.
     </p>
   </section>
 
@@ -332,11 +332,14 @@
 
   <section class="panel">
     <div class="results-head">
-      <h2>
-        Kết quả
-        <span id="count" class="hint"></span>
-        <span id="partial-label" class="badge" hidden>Kết quả một phần</span>
-      </h2>
+      <div class="results-title">
+        <h2>
+          Kết quả
+          <span id="count" class="hint"></span>
+          <span id="partial-label" class="badge" hidden>Kết quả một phần</span>
+        </h2>
+        <p id="scan-params" class="hint"></p>
+      </div>
       <div class="tools">
         <button id="dl-json" type="button" class="secondary" disabled>Tải JSON</button>
         <button id="dl-csv" type="button" class="secondary" disabled>Tải CSV</button>
@@ -567,6 +570,7 @@
     bar: document.getElementById("bar-fill"),
     alert: document.getElementById("alert"),
     count: document.getElementById("count"),
+    params: document.getElementById("scan-params"),
     partial: document.getElementById("partial-label"),
     tbody: document.getElementById("results-body"),
     dlJson: document.getElementById("dl-json"),
@@ -750,35 +754,94 @@
   // Tiến độ
   // ------------------------------------------------------------------
 
+  function batchText(job) {
+    var batch = job.batch;
+    if (!batch || !batch.total) {
+      return "";
+    }
+    var text = "Lô " + batch.index + "/" + batch.total;
+    if (batch.port_range) {
+      text += " (cổng " + batch.port_range + ")";
+    }
+    return text;
+  }
+
+  function jobPortsText(job) {
+    var batch = job.batch;
+    if (!batch || !batch.ports_total) {
+      return "";
+    }
+    return "Đã quét " + (batch.ports_done || 0) + "/" + batch.ports_total + " cổng";
+  }
+
   function phaseCountText(job) {
     var progress = job.progress || {};
-    var done = progress.done || 0;
-    var total = progress.total || 0;
     if (job.phase === "discovery") {
-      return "Đã dò " + done + "/" + total + " host";
+      return "Đã dò " + (progress.done || 0) + "/" + (progress.total || 0) + " host";
     }
-    if (job.phase === "scanning") {
-      return "Đã quét " + done + "/" + total + " cổng của host hiện tại";
+    // Đi theo tổng số cổng của cả job, không phải của riêng lô hiện tại.
+    var text = jobPortsText(job);
+    if (!text) {
+      text = "Đã quét " + (progress.done || 0) + "/" + (progress.total || 0) + " cổng";
     }
-    return total > 0 ? done + "/" + total : "";
+    return text;
   }
 
   function hostCounterText(job) {
-    // Trong giai đoạn quét cổng, chỉ số host nằm ở đầu thông báo dạng "[1/2]".
+    // Chỉ hiện khi lần quét thật sự có nhiều hơn một host.
     var match = /^\[(\d+)\/(\d+)\]/.exec(job.message || "");
-    if (match) {
-      return "Host " + match[1] + "/" + match[2];
+    if (!match || Number(match[2]) <= 1) {
+      return "";
     }
-    if (job.phase === "discovery") {
-      var progress = job.progress || {};
-      return "Host " + (progress.done || 0) + "/" + (progress.total || 0);
+    return "Host " + match[1] + "/" + match[2];
+  }
+
+  function progressRatio(job) {
+    // Thanh tiến độ chạy theo tổng số cổng của cả job; nếu server cũ chưa trả
+    // trường 'batch' thì lùi về tiến độ trong lô hiện tại.
+    var batch = job.batch;
+    if (batch && batch.ports_total) {
+      return { done: batch.ports_done || 0, total: batch.ports_total };
     }
-    return "";
+    var progress = job.progress || {};
+    return { done: progress.done || 0, total: progress.total || 0 };
+  }
+
+  function detailMessage(job) {
+    // Thông báo của server đôi khi mở đầu bằng chính nhãn trạng thái
+    // ("Hoàn tất: 2 cổng mở."), nên bỏ phần lặp đó ở dòng chi tiết.
+    var message = (job.message || "").trim();
+    var label = STATUS_TEXT[job.status];
+    if (!label) {
+      return message;
+    }
+    var prefixes = [label + ":", label + " —", label + " –", label + " -"];
+    for (var i = 0; i < prefixes.length; i++) {
+      if (message.indexOf(prefixes[i]) === 0) {
+        return message.slice(prefixes[i].length).trim();
+      }
+    }
+    return message;
+  }
+
+  function scanParamsText(job) {
+    // Lấy từ job đã chạy, không lấy từ ô nhập hiện tại, để kết quả luôn khớp
+    // với tham số của lần quét đang hiển thị.
+    var target = job.target ? String(job.target) : "";
+    var ports = job.ports ? String(job.ports) : "";
+    var parts = [];
+    if (target) {
+      parts.push("Mục tiêu " + target);
+    }
+    if (ports) {
+      parts.push("Dải cổng " + ports);
+    }
+    return parts.join(" · ");
   }
 
   function renderJob(job) {
-    var progress = job.progress || { done: 0, total: 0 };
-    setProgress(progress.done || 0, progress.total || 0);
+    var ratio = progressRatio(job);
+    setProgress(ratio.done, ratio.total);
 
     var statusLabel = STATUS_TEXT[job.status] || job.status;
     var phaseLabel = PHASE_TEXT[job.phase];
@@ -786,7 +849,7 @@
       ? statusLabel + " — " + phaseLabel
       : statusLabel;
 
-    var parts = [hostCounterText(job), phaseCountText(job)];
+    var parts = [batchText(job), hostCounterText(job), phaseCountText(job)];
     var phaseLine = [];
     for (var i = 0; i < parts.length; i++) {
       if (parts[i]) {
@@ -794,7 +857,8 @@
       }
     }
     els.phase.textContent = phaseLine.join(" · ");
-    els.message.textContent = job.message || "";
+    els.message.textContent = detailMessage(job);
+    els.params.textContent = scanParamsText(job);
 
     var errors = job.errors || [];
     if (errors.length > 0) {
@@ -803,7 +867,8 @@
 
     renderResults(job.results || [], job);
     els.count.textContent = "(" + (job.total_open_ports || 0) + " cổng mở)";
-    els.partial.hidden = !(job.status === "cancelled" || job.status === "error");
+    // Kết quả còn thiếu khi job chưa xong (còn lô chưa chạy), bị hủy hoặc lỗi.
+    els.partial.hidden = job.status === "done";
 
     var ready = job.status !== "running";
     els.dlJson.disabled = !ready;
@@ -941,6 +1006,7 @@
     clearRows();
     renderEmptyRow("Đang gửi yêu cầu quét...");
     els.count.textContent = "";
+    els.params.textContent = "";
     els.partial.hidden = true;
     els.dlJson.disabled = true;
     els.dlCsv.disabled = true;

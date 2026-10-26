@@ -37,6 +37,7 @@ Port Scanner/
 ├── web_server.py      # web server cục bộ, chỉ bind 127.0.0.1
 ├── README.md
 ├── tests/             # kiểm thử tự động bằng unittest
+│   ├── test_batching.py
 │   ├── test_parsing.py
 │   ├── test_report.py
 │   └── test_web_server.py
@@ -58,7 +59,10 @@ Bộ kiểm thử dùng `unittest` của thư viện chuẩn, không cần cài 
 - `tests/test_parsing.py`: phân tích mục tiêu (IPv4/CIDR) và dải cổng, kiểm tra dải nội bộ.
 - `tests/test_report.py`: dựng và ghi báo cáo JSON/CSV, xử lý ký tự đặc biệt trong banner.
 - `tests/test_web_server.py`: API của web server — token, Host/Origin, giới hạn mục tiêu,
-  giới hạn số cổng và số luồng, hai lần quét cùng lúc, hủy quét, banner chứa HTML.
+  giới hạn số cổng và số luồng, hai lần quét cùng lúc, hủy quét, banner chứa HTML,
+  quét theo lô (chia lô, kết quả từng phần, hủy giữa các lô, giới hạn tổng lượt thử).
+- `tests/test_batching.py`: hàm chia lô cổng, đếm host của mục tiêu, giới hạn tổng
+  lượt thử và sắp xếp kết quả theo IP.
 
 Mọi bài kiểm thử chỉ làm việc với `127.0.0.1`. Bài kiểm tra mục tiêu ngoài dải nội bộ
 dùng `mock` để khẳng định không có kết nối nào được mở ra ngoài loopback. Thư mục tạm
@@ -317,10 +321,12 @@ Giao diện gồm:
 - **Quét** / **Hủy quét**; nhấn Enter trong ô nhập cũng bắt đầu quét. Trong lúc
   chạy, các ô nhập và nút Quét bị vô hiệu hóa, chỉ nút Hủy còn bật.
 - **Vùng tiến độ** (`aria-live="polite"`) hiển thị giai đoạn (dò host sống / quét
-  cổng), số host đã xong trên tổng số, số cổng đã quét và thời gian đã trôi qua.
+  cổng), lô đang chạy, số host đã xong, số cổng đã quét trên tổng số cổng của cả
+  job và thời gian đã trôi qua.
 - **Bảng kết quả** (host, cổng, dịch vụ, banner), sắp xếp theo địa chỉ IP bằng so
   sánh số rồi theo cổng; banner rỗng hiện `—`, banner dài được cắt gọn và hiện đầy
-  đủ khi rê chuột. Khi quét bị hủy hoặc lỗi, bảng có nhãn "Kết quả một phần".
+  đủ khi rê chuột. Bảng tự cập nhật sau mỗi lô, không chờ hết cả job. Nhãn "Kết quả
+  một phần" hiện khi còn lô chưa chạy, khi bị hủy hoặc khi lỗi.
 - Hai nút **tải JSON/CSV**, và giao diện tự chuyển màu theo chế độ tối của hệ điều
   hành (`prefers-color-scheme`) và co giãn trên màn hình hẹp.
 
@@ -331,6 +337,24 @@ trên vùng trạng thái, không in JSON thô.
 Kiểm tra IP và prefix ở phía giao diện chỉ để giúp nhập liệu nhanh; mọi giới hạn an
 toàn vẫn do server quyết định.
 
+### Quét theo lô
+
+Mỗi job có thể nhận tối đa `65535` cổng. Server tự chia danh sách cổng (đã sắp xếp
+và loại trùng) thành các **lô liên tiếp**, mỗi lô tối đa **2048** cổng, rồi quét
+lần lượt từng lô:
+
+- Ví dụ nhập `1-4096` sẽ chạy lô 1 (`1-2048`), hiện kết quả, rồi mới chạy lô 2
+  (`2049-4096`).
+- Với CIDR, bước **dò host sống chỉ chạy một lần** ở đầu; mỗi lô sau đó quét tất
+  cả host sống.
+- Sau mỗi lô, kết quả được gộp ngay vào job nên API polling trả về được **kết quả
+  từng phần**. Kết quả luôn sắp xếp theo IP (so sánh số) rồi theo cổng.
+- Hủy quét có hiệu lực cả giữa các lô lẫn trong lô đang chạy: job chuyển
+  `cancelled`, kết quả của các lô đã xong được giữ nguyên và vẫn tải về được.
+
+Hằng số kích thước lô nằm ở một chỗ duy nhất trong `web_server.py`
+(`BATCH_SIZE = 2048`).
+
 ### API
 
 | Phương thức | Đường dẫn | Mô tả |
@@ -339,10 +363,45 @@ toàn vẫn do server quyết định.
 | `POST` | `/api/scan` | Bắt đầu quét. Body JSON: `{"target": "...", "ports": "..."}`. Trả `202` kèm `id`. Trường `target` là `"ip"` hoặc `"ip/prefix"`. |
 | `GET` | `/api/scan/<id>` | Trạng thái, tiến độ và kết quả của một lần quét. |
 | `POST` | `/api/scan/<id>/cancel` | Yêu cầu hủy lần quét đang chạy. |
-| `GET` | `/api/scan/<id>/download?format=json\|csv` | Tải báo cáo, dùng lại `report.py`. |
+| `GET` | `/api/scan/<id>/download?format=json\|csv` | Tải báo cáo, dùng lại `report.py`. Tải được cả khi job đang chạy hoặc đã bị hủy: chỉ trả những kết quả đã có. |
 
-Mã lỗi: `400` dữ liệu sai, `403` thiếu token / Host hoặc Origin lạ / mục tiêu
-ngoài dải nội bộ, `404` id không tồn tại, `409` đang có lần quét khác chạy,
+`GET /api/scan/<id>` trả về (giữ nguyên các trường cũ):
+
+```json
+{
+  "id": "…",
+  "target": "127.0.0.1",
+  "ports": "1-4096",
+  "status": "running",
+  "phase": "scanning",
+  "message": "[1/1] 127.0.0.1: 512/2048 cổng",
+  "progress": { "done": 512, "total": 2048 },
+  "batch": {
+    "index": 1,
+    "total": 2,
+    "completed": 0,
+    "port_range": "1-2048",
+    "ports_done": 512,
+    "ports_total": 4096
+  },
+  "started_at": "2026-10-26T12:00:00+07:00",
+  "finished_at": null,
+  "total_open_ports": 0,
+  "results": [],
+  "errors": [],
+  "downloads": { "json": "…", "csv": "…" }
+}
+```
+
+- `progress` là tiến độ **trong lô hiện tại**; `batch.ports_done / batch.ports_total`
+  là tiến độ **của cả job** (giao diện dùng số này cho thanh tiến độ).
+- `batch.completed` là số lô đã chạy xong.
+
+Metadata trong file tải về gồm `target`, `port_range`, `total_open_ports`,
+`scan_duration_seconds`, `batches_completed` và `batches_total`.
+
+Mã lỗi: `400` dữ liệu sai / vượt giới hạn, `403` thiếu token / Host hoặc Origin lạ /
+mục tiêu ngoài dải nội bộ, `404` id không tồn tại, `409` đang có lần quét khác chạy,
 `413` body quá lớn. Lỗi luôn trả JSON `{"error": "..."}`, không lộ traceback.
 
 ### Ràng buộc an toàn của web server
@@ -354,7 +413,13 @@ ngoài dải nội bộ, `404` id không tồn tại, `409` đang có lần qué
     `192.168.0.0/16`, `127.0.0.0/8`), ngoài dải thì từ chối hẳn — trên web
     **không có** cơ chế xác nhận để quét mục tiêu ngoài;
   - CIDR lớn hơn `/24` bị từ chối;
-  - tối đa `2048` cổng mỗi lần quét và `100` luồng; timeout do server cố định.
+  - tối đa `65535` cổng mỗi job, chia thành các lô `2048` cổng;
+  - **giới hạn tổng `262144` lượt thử** cho cả job (tương đương 256 host × 1024
+    cổng), vì dải lớn nhân nhiều máy sẽ rất nặng. Giới hạn này được kiểm tra cả
+    khi bắt đầu job (dùng số host tối đa của dải) lẫn sau khi dò host sống (dùng
+    số host thực tế). Vượt quá thì trả `400` kèm hướng dẫn giảm số cổng hoặc thu
+    nhỏ dải CIDR, và **không mở kết nối nào**;
+  - tối đa `100` luồng; timeout do server cố định.
 - Chống bị trang web khác lợi dụng: kiểm tra header `Host` (chỉ nhận
   `127.0.0.1:<cổng>` hoặc `localhost:<cổng>`), kiểm tra `Origin` với mọi request
   `POST`, và bắt buộc gửi token ngẫu nhiên sinh bằng `secrets` mỗi lần khởi động

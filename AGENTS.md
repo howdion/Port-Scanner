@@ -62,7 +62,7 @@ Mỗi lần chỉ làm MỘT bước trong lộ trình, xong thì commit và pus
   1. `git status` để xem những file đã thay đổi
   2. `git add` các file liên quan (không dùng `git add .` mù quáng)
   3. `git commit -m "<type>: <mô tả ngắn>"` với type là feat, fix, docs, refactor
-  4. `git push origin agent-web`
+  4. `git push origin agent-batch`
 - Mỗi task một commit riêng, không gộp nhiều task.
 - Không commit file `.env`, khóa bí mật, hoặc thư mục `__pycache__`, `node_modules`.
 - Tuyệt đối không dùng `git push --force` hay `git reset --hard`.
