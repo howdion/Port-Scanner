@@ -69,6 +69,8 @@ def scan_ports(
     ports: list[int],
     timeout: float = 1.0,
     workers: int = 100,
+    on_progress: Callable[[int, int], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> tuple[list[int], list[tuple[int, str]]]:
     """Quét nhiều cổng song song bằng thread pool.
 
@@ -76,25 +78,48 @@ def scan_ports(
     cùng lúc. Các cổng đóng sẽ trả về nhanh hoặc chờ tối đa ``timeout`` giây,
     nên chương trình không bị treo.
 
+    Args:
+        host: Địa chỉ IPv4 của mục tiêu.
+        ports: Danh sách cổng cần quét.
+        timeout: Thời gian chờ tối đa cho mỗi kết nối (giây).
+        workers: Số luồng quét song song.
+        on_progress: Callback tùy chọn nhận (đã xong, tổng) sau mỗi cổng.
+        should_cancel: Callback tùy chọn; trả về True để dừng sớm và bỏ các cổng
+            còn đang xếp hàng. Kết quả đã quét được vẫn trả về bình thường.
+
     Returns:
         Một tuple gồm danh sách cổng mở (đã sắp xếp) và danh sách lỗi mạng
         dạng ``(cổng, thông báo)``.
     """
     open_ports: list[int] = []
     errors: list[tuple[int, str]] = []
+    total = len(ports)
+    done = 0
+    cancelled = False
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
+    executor = ThreadPoolExecutor(max_workers=workers)
+    try:
         futures = {
             executor.submit(scan_port, host, port, timeout): port
             for port in ports
         }
         for future in as_completed(futures):
+            if should_cancel is not None and should_cancel():
+                cancelled = True
+                break
             port = futures[future]
             try:
                 if future.result():
                     open_ports.append(port)
             except OSError as exc:
                 errors.append((port, str(exc)))
+            done += 1
+            if on_progress is not None:
+                on_progress(done, total)
+    finally:
+        # Khi hủy, cancel_futures bỏ các cổng chưa chạy; các luồng đang chạy
+        # vẫn kết thúc trong khoảng timeout nên không bị treo lâu.
+        executor.shutdown(wait=True, cancel_futures=cancelled)
 
     open_ports.sort()
     return open_ports, errors
@@ -127,6 +152,7 @@ def discover_hosts(
     timeout: float = 0.3,
     workers: int = 100,
     on_progress: Callable[[int, int, str, bool], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> list[str]:
     """Dò song song các host còn sống trong danh sách.
 
@@ -136,6 +162,7 @@ def discover_hosts(
         timeout: Thời gian chờ tối đa cho mỗi lần thử (giây).
         workers: Số luồng dò song song.
         on_progress: Hàm callback nhận (đã xong, tổng, host, còn sống) sau mỗi host.
+        should_cancel: Callback tùy chọn; trả về True để dừng dò sớm.
 
     Returns:
         Danh sách host sống, giữ nguyên thứ tự đầu vào.
@@ -145,12 +172,18 @@ def discover_hosts(
 
     statuses: dict[str, bool] = {}
     max_workers = max(1, min(workers, len(hosts)))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    cancelled = False
+
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    try:
         futures = {
             executor.submit(discover_host, host, ports, timeout): host
             for host in hosts
         }
         for done, future in enumerate(as_completed(futures), start=1):
+            if should_cancel is not None and should_cancel():
+                cancelled = True
+                break
             host = futures[future]
             try:
                 is_alive = future.result()
@@ -159,6 +192,8 @@ def discover_hosts(
             statuses[host] = is_alive
             if on_progress is not None:
                 on_progress(done, len(hosts), host, is_alive)
+    finally:
+        executor.shutdown(wait=True, cancel_futures=cancelled)
 
     return [host for host in hosts if statuses.get(host)]
 
