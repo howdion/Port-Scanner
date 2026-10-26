@@ -67,71 +67,19 @@ của bài kiểm thử nằm trong `reports/` (đã bị `.gitignore` bỏ qua)
 
 ## Cách chạy
 
-Trên Windows:
-
 ```powershell
+# Quét một máy, dải cổng 1-1024 (cũng là mặc định khi chạy không tham số)
 python main.py 127.0.0.1 --ports 1-1024
-```
 
-Quét vài cổng cụ thể để xem tên dịch vụ và banner:
+# Quét một dải CIDR (tối đa /24)
+python main.py 127.0.0.0/30 --ports 135,445
 
-```powershell
-python main.py 127.0.0.1 --ports 135,445,5357
-```
-
-Quét một dải CIDR (tối đa /24):
-
-```powershell
-python main.py 127.0.0.0/30 --ports 1-1024
-```
-
-Xuất báo cáo JSON/CSV (thư mục `reports/` được tạo tự động):
-
-```powershell
+# Xuất báo cáo JSON (hoặc --format csv)
 python main.py 127.0.0.1 --ports 1-1024 --output reports/single.json --format json
-python main.py 127.0.0.1 --ports 1-1024 --output reports/single.csv --format csv
-python main.py 127.0.0.0/30 --ports 1-1024 --output reports/cidr.json --format json
 ```
 
-Nếu `--output` chỉ là tên file, báo cáo được ghi vào `reports/`.
-
-Một số tùy chọn hữu ích:
-
-```powershell
-# Ghi đè báo cáo đã tồn tại mà không hỏi
-python main.py 127.0.0.1 --ports 1-1024 --output reports/single.json --format json --force
-
-# Tự xác nhận mục tiêu ngoài dải nội bộ (chỉ dùng khi có quyền quét)
-python main.py 203.0.113.10 --ports 53 --yes
-
-# Chỉ dò host sống qua cổng 135
-python main.py 127.0.0.0/30 --ports 135,445 --discovery-ports 135
-```
-
-Khi chạy không tương tác (stdin không phải terminal), cần `--yes` để xác nhận mục
-tiêu ngoài dải nội bộ và `--force` để ghi đè báo cáo.
-
-Quét một vài cổng cụ thể với timeout 1 giây:
-
-```powershell
-python main.py 192.168.1.10 --ports 22,80,443 --timeout 1
-```
-
-Trên Linux/macOS:
-
-```bash
-python main.py 127.0.0.1 --ports 1-1024
-```
-
-Chạy không tham số sẽ quét `127.0.0.1` với các cổng `1-1024`:
-
-```powershell
-python main.py
-```
-
-Tăng `--timeout` nếu mạng chậm; tăng `--banner-timeout` nếu dịch vụ trả banner
-chậm; tăng `--discovery-timeout` nếu host phản hồi chậm; giảm `--workers` nếu
-muốn hạn chế số kết nối đồng thời.
+Lệnh giống nhau trên Windows, Linux và macOS. Xem đầy đủ các tham số ở bảng bên
+dưới, và các ví dụ kèm kết quả ở mục [Ví dụ chạy và kết quả](#ví-dụ-chạy-và-kết-quả).
 
 ## Tham số
 
@@ -149,7 +97,19 @@ muốn hạn chế số kết nối đồng thời.
 | `--output` | không ghi file | Đường dẫn file báo cáo; nếu chỉ ghi tên file thì đặt trong `reports/`. |
 | `--format` | `json` | Định dạng báo cáo: `json` hoặc `csv` (chỉ dùng khi có `--output`). |
 
-## Ví dụ kết quả
+Mẹo tinh chỉnh: tăng `--timeout` nếu mạng chậm; tăng `--banner-timeout` nếu dịch
+vụ trả banner chậm; tăng `--discovery-timeout` nếu host phản hồi chậm; giảm
+`--workers` nếu muốn hạn chế số kết nối đồng thời.
+
+## Ví dụ chạy và kết quả
+
+### Quét vài cổng cụ thể
+
+Xem tên dịch vụ và banner:
+
+```powershell
+python main.py 127.0.0.1 --ports 135,445,5357
+```
 
 ```text
 Đang quét 127.0.0.1 với 3 cổng (timeout 1.0s, banner 0.5s, 100 luồng)...
@@ -162,7 +122,11 @@ Cổng mở trên 127.0.0.1:
 Hoàn tất: 3 cổng mở trong 0.53 giây.
 ```
 
-## Ví dụ quét CIDR
+### Quét dải CIDR
+
+```powershell
+python main.py 127.0.0.0/30 --ports 1-1024
+```
 
 ```text
 Đang kiểm tra host sống trong 127.0.0.0/30 (2 host, cổng dò 22,80,135,443,445, timeout 0.3s)...
@@ -188,6 +152,38 @@ Tổng cộng: 2 host sống, 4 cổng mở.
 
 Thứ tự các dòng tiến độ có thể khác thứ tự host vì các host được dò song song;
 kết quả quét vẫn được in theo thứ tự địa chỉ.
+
+### Xuất báo cáo JSON/CSV
+
+Thư mục `reports/` được tạo tự động; nếu `--output` chỉ là tên file, báo cáo được
+ghi vào `reports/`:
+
+```powershell
+python main.py 127.0.0.1 --ports 1-1024 --output reports/single.json --format json
+python main.py 127.0.0.1 --ports 1-1024 --output reports/single.csv --format csv
+python main.py 127.0.0.0/30 --ports 1-1024 --output reports/cidr.json --format json
+```
+
+Nội dung file mẫu xem ở mục [Xuất báo cáo JSON/CSV](#xuất-báo-cáo-jsoncsv).
+
+### Một số tùy chọn khác
+
+```powershell
+# Quét vài cổng với timeout 1 giây
+python main.py 192.168.1.10 --ports 22,80,443 --timeout 1
+
+# Ghi đè báo cáo đã tồn tại mà không hỏi
+python main.py 127.0.0.1 --ports 1-1024 --output reports/single.json --format json --force
+
+# Tự xác nhận mục tiêu ngoài dải nội bộ (chỉ dùng khi có quyền quét)
+python main.py 203.0.113.10 --ports 53 --yes
+
+# Chỉ dò host sống qua cổng 135
+python main.py 127.0.0.0/30 --ports 135,445 --discovery-ports 135
+```
+
+Khi chạy không tương tác (stdin không phải terminal), cần `--yes` để xác nhận mục
+tiêu ngoài dải nội bộ và `--force` để ghi đè báo cáo.
 
 ## Cách hoạt động
 

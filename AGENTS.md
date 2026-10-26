@@ -62,7 +62,7 @@ Mỗi lần chỉ làm MỘT bước trong lộ trình, xong thì commit và pus
   1. `git status` để xem những file đã thay đổi
   2. `git add` các file liên quan (không dùng `git add .` mù quáng)
   3. `git commit -m "<type>: <mô tả ngắn>"` với type là feat, fix, docs, refactor
-  4. `git push origin agent-batch`
+  4. Push lên nhánh mà tôi yêu cầu, nếu nhánh chưa tồn tại thì hãy tạo mới (không push lên main, nhớ kiểm tra nhánh hiện tại)
 - Mỗi task một commit riêng, không gộp nhiều task.
 - Không commit file `.env`, khóa bí mật, hoặc thư mục `__pycache__`, `node_modules`.
 - Tuyệt đối không dùng `git push --force` hay `git reset --hard`.
@@ -75,9 +75,3 @@ Mỗi lần chỉ làm MỘT bước trong lộ trình, xong thì commit và pus
 ## Khi push thất bại
 - Nếu `git push` lỗi liên quan SSH/MSYS2: không tự sửa cấu hình, không đổi remote sang HTTPS.
 - Giữ nguyên commit ở local, báo tôi mã commit và lệnh push cần chạy.
-
-## Môi trường Python
-- Luôn dùng Python trong virtual environment: `.venv\Scripts\python.exe`
-- Chạy chương trình bằng: `.venv\Scripts\python.exe main.py`
-- Cài thư viện bằng: `.venv\Scripts\python.exe -m pip install <tên>`
-- Không dùng lệnh `python` hay `pip` trần (trên máy này chúng trỏ vào bản MSYS2).
