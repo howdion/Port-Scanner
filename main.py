@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 from report import ScanRecord, write_report
-from scanner import discover_hosts, grab_banners, scan_ports
+from scanner import discover_hosts, scan_targets
 from services import get_service_name
 
 
@@ -35,6 +35,14 @@ CIDR_MIN_PREFIX = 18
 # - vượt HARD_ATTEMPTS: từ chối hẳn, không có cách nào vượt qua.
 WARN_ATTEMPTS = 500_000
 HARD_ATTEMPTS = 5_000_000
+
+# Số luồng song song tối đa cho mỗi giai đoạn. Mặc định vẫn là 100; người dùng
+# có thể nâng tới 10.000 luồng khi cần quét rất nhanh trên máy đủ mạnh.
+MAX_CONCURRENCY = 10_000
+DEFAULT_CONCURRENCY = 100
+# Vượt mốc này thì cảnh báo (không chặn): mỗi luồng giữ một cổng tạm
+# (ephemeral port) trên máy nên số luồng quá lớn có thể làm cạn cổng tạm.
+CONCURRENCY_WARN = 2_000
 
 # Tên hai giai đoạn của một lần quét CIDR. Mục tiêu là một IP đơn chỉ có giai
 # đoạn quét cổng.
@@ -132,6 +140,35 @@ def stage_warning_lines(stage: str, attempts: int, seconds: float) -> list[str]:
         "(theo timeout và số luồng hiện tại).",
         "Quét dải lớn có thể làm chậm mạng và dễ bị hệ thống an ninh phát hiện.",
     ]
+
+
+def concurrency_warning_lines(workers: int) -> list[str]:
+    """Cảnh báo khi số luồng vượt mốc an toàn; KHÔNG chặn chạy.
+
+    Mỗi luồng giữ một kết nối TCP đang mở nên chiếm một cổng tạm của máy. Số
+    luồng quá lớn có thể làm cạn dải cổng tạm (ephemeral ports) và khiến cả
+    chính chương trình lẫn ứng dụng khác không mở được kết nối mới.
+    """
+    if workers <= CONCURRENCY_WARN:
+        return []
+    return [
+        f"CẢNH BÁO: {format_attempts(workers)} luồng song song, vượt mốc "
+        f"{format_attempts(CONCURRENCY_WARN)} luồng.",
+        "Mỗi luồng giữ một cổng tạm trên máy; quá nhiều luồng có thể làm cạn "
+        "cổng tạm và khiến kết nối mới thất bại.",
+        "Chương trình vẫn tiếp tục chạy, chỉ cảnh báo để bạn cân nhắc.",
+    ]
+
+
+def warn_high_concurrency(workers: int) -> None:
+    """In cảnh báo số luồng cao (nếu có)."""
+    for line in concurrency_warning_lines(workers):
+        print(line)
+
+
+def concurrency_value(value: str) -> int:
+    """Kiểu tham số cho số luồng: số nguyên từ 1 đến MAX_CONCURRENCY."""
+    return positive_int(value, maximum=MAX_CONCURRENCY)
 
 
 def configure_output_encoding() -> None:
@@ -253,14 +290,19 @@ def positive_float(value: str) -> float:
     return number
 
 
-def positive_int(value: str) -> int:
-    """Kiểm tra số luồng là số nguyên lớn hơn 0."""
+def positive_int(value: str, maximum: int | None = None) -> int:
+    """Kiểm tra số nguyên dương, có thể kèm trần ``maximum``."""
     try:
         number = int(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("số luồng phải là số nguyên") from exc
     if number <= 0:
         raise argparse.ArgumentTypeError("số luồng phải lớn hơn 0")
+    if maximum is not None and number > maximum:
+        raise argparse.ArgumentTypeError(
+            f"số luồng phải từ 1 đến {maximum:,} (đã nhận {number:,}); "
+            "quá nhiều luồng có thể làm cạn cổng tạm của máy"
+        )
     return number
 
 
@@ -451,6 +493,14 @@ def load_hosts_file(path_value: str) -> list[ipaddress.IPv4Address]:
 def format_port_line(port: int, banner: str | None) -> str:
     """Định dạng một dòng kết quả cổng kèm tên dịch vụ và banner."""
     line = f"  {port}/tcp  {get_service_name(port)}"
+    if banner:
+        line += f"  |  {banner}"
+    return line
+
+
+def format_live_line(host: str, port: int, banner: str | None) -> str:
+    """Dòng kết quả in ngay khi tìm thấy cổng mở (có tiền tố host)."""
+    line = f"  {host}:{port}  {get_service_name(port)}"
     if banner:
         line += f"  |  {banner}"
     return line
@@ -670,6 +720,7 @@ def run_discover(args: argparse.Namespace) -> int:
         f"({len(hosts)} host, cổng dò {format_port_spec(list(discovery_ports))}, "
         f"timeout {args.discovery_timeout}s, {args.concurrency} luồng)..."
     )
+    warn_high_concurrency(args.concurrency)
 
     def report_progress(done: int, total: int, host: str, is_alive: bool) -> None:
         status = "sống" if is_alive else "không phản hồi"
@@ -704,123 +755,98 @@ def run_discover(args: argparse.Namespace) -> int:
     return 1 if status != 0 else 0
 
 
-def scan_one_host(host: ipaddress.IPv4Address, args: argparse.Namespace) -> int:
-    """Giai đoạn 2 với đúng một host: giữ nguyên hành vi quét một IP như trước."""
-    target = str(host)
+def scan_hosts(
+    hosts: list[ipaddress.IPv4Address],
+    args: argparse.Namespace,
+) -> int:
+    """Giai đoạn 2 chạy một lượt: quét cổng trên mọi host, in kết quả ngay.
+
+    Mọi cặp (host, cổng) được đưa vào cùng một thread pool, không chia lô và
+    không chờ host này xong mới sang host khác. Nhờ vậy kết quả hiện ra ngay
+    khi tìm thấy cổng mở và mọi luồng đều có việc cho tới cặp cuối cùng.
+    """
     ports = args.ports
-    print(
-        f"Đang quét {target} với {len(ports)} cổng "
-        f"(timeout {args.timeout}s, banner {args.banner_timeout}s, "
-        f"{args.workers} luồng)..."
-    )
-    started = time.perf_counter()
-    try:
-        open_ports, errors = scan_ports(
-            target,
-            ports,
-            timeout=args.timeout,
-            workers=args.workers,
+    host_texts = [str(host) for host in hosts]
+    total = len(host_texts) * len(ports)
+    if len(host_texts) == 1:
+        print(
+            f"Đang quét {host_texts[0]} với {len(ports)} cổng "
+            f"(timeout {args.timeout}s, banner {args.banner_timeout}s, "
+            f"{args.workers} luồng)..."
         )
-        banners = grab_banners(
-            target,
-            open_ports,
-            timeout=args.banner_timeout,
+    else:
+        print(
+            f"Đang quét {len(host_texts)} host với {len(ports)} cổng "
+            f"(tổng {format_attempts(total)} lượt, timeout {args.timeout}s, "
+            f"banner {args.banner_timeout}s, {args.workers} luồng)..."
+        )
+    warn_high_concurrency(args.workers)
+
+    open_by_host: dict[str, list[tuple[int, str | None]]] = {
+        host_text: [] for host_text in host_texts
+    }
+    started = time.perf_counter()
+
+    def report_result(host_text: str, port: int, banner: str | None) -> None:
+        # In ngay để người dùng thấy tiến độ, không đợi hết lượt quét.
+        open_by_host[host_text].append((port, banner))
+        print(format_live_line(host_text, port, banner), flush=True)
+
+    try:
+        _, errors = scan_targets(
+            ((host_text, port) for host_text in host_texts for port in ports),
+            total=total,
             workers=args.workers,
+            timeout=args.timeout,
+            banner_timeout=args.banner_timeout,
+            on_result=report_result,
         )
     except KeyboardInterrupt:
         print("\nĐã hủy bởi người dùng.")
         return 130
     elapsed = time.perf_counter() - started
     scanned_at = current_timestamp()
-    records = build_records(target, open_ports, banners, scanned_at)
 
     if errors:
         print(f"\nCảnh báo: {len(errors)} cổng gặp lỗi mạng, ví dụ:")
-        for port, message in errors[:5]:
-            print(f"  {port}/tcp: {message}")
-
-    print()
-    if open_ports:
-        print(f"Cổng mở trên {target}:")
-        for port in open_ports:
-            print(format_port_line(port, banners.get(port)))
-    else:
-        print(f"Không tìm thấy cổng mở trên {target}.")
-
-    print(f"\nHoàn tất: {len(open_ports)} cổng mở trong {elapsed:.2f} giây.")
-
-    report_status = save_report_if_requested(
-        args, [host], ports, records, elapsed
-    )
-
-    if errors and not open_ports:
-        print("Kiểm tra kết nối mạng hoặc thử tăng --timeout.")
-        return 1
-    return 0 if report_status == 0 else 1
-
-
-def scan_host_list(
-    hosts: list[ipaddress.IPv4Address],
-    args: argparse.Namespace,
-) -> int:
-    """Giai đoạn 2 với danh sách host đã biết; KHÔNG dò host sống."""
-    ports = args.ports
-    print(
-        f"Đang quét {len(hosts)} host với {len(ports)} cổng "
-        f"(timeout {args.timeout}s, banner {args.banner_timeout}s, "
-        f"{args.workers} luồng)..."
-    )
+        for host_text, port, message in errors[:5]:
+            print(f"  {host_text}:{port}/tcp: {message}")
 
     records: list[ScanRecord] = []
     total_open_ports = 0
-    started = time.perf_counter()
-
-    for index, host in enumerate(hosts, start=1):
-        host_text = str(host)
-        print(f"\n[{index}/{len(hosts)}] Đang quét {host_text} ({len(ports)} cổng)...")
-        host_started = time.perf_counter()
-        try:
-            open_ports, errors = scan_ports(
-                host_text,
-                ports,
-                timeout=args.timeout,
-                workers=args.workers,
-            )
-            banners = grab_banners(
-                host_text,
-                open_ports,
-                timeout=args.banner_timeout,
-                workers=args.workers,
-            )
-        except KeyboardInterrupt:
-            print("\nĐã hủy bởi người dùng.")
-            return 130
-        host_elapsed = time.perf_counter() - host_started
-        scanned_at = current_timestamp()
-        records.extend(build_records(host_text, open_ports, banners, scanned_at))
-
-        if errors:
-            print(f"Cảnh báo: {len(errors)} cổng gặp lỗi mạng, ví dụ:")
-            for port, message in errors[:5]:
-                print(f"  {port}/tcp: {message}")
-
-        if open_ports:
-            print(f"Cổng mở trên {host_text}:")
-            for port in open_ports:
-                print(format_port_line(port, banners.get(port)))
-            total_open_ports += len(open_ports)
-        else:
+    print()
+    for host_text in host_texts:
+        entries = sorted(open_by_host[host_text])
+        if not entries:
             print(f"Không tìm thấy cổng mở trên {host_text}.")
-
-        print(
-            f"Hoàn tất host {host_text}: {len(open_ports)} cổng mở "
-            f"trong {host_elapsed:.2f} giây."
+            continue
+        print(f"Cổng mở trên {host_text}:")
+        for port, banner in entries:
+            print(format_port_line(port, banner))
+        total_open_ports += len(entries)
+        banners = {port: banner for port, banner in entries if banner}
+        records.extend(
+            build_records(
+                host_text,
+                [port for port, _ in entries],
+                banners,
+                scanned_at,
+            )
         )
 
-    elapsed = time.perf_counter() - started
-    print(f"\nTổng cộng: {len(hosts)} host, {total_open_ports} cổng mở.")
+    if len(host_texts) == 1:
+        print(f"\nHoàn tất: {total_open_ports} cổng mở trong {elapsed:.2f} giây.")
+    else:
+        print(
+            f"\nTổng cộng: {len(host_texts)} host, {total_open_ports} cổng mở "
+            f"trong {elapsed:.2f} giây."
+        )
 
     report_status = save_report_if_requested(args, hosts, ports, records, elapsed)
+
+    if errors and not total_open_ports:
+        print("Kiểm tra kết nối mạng hoặc thử tăng --timeout.")
+        return 1
     return 0 if report_status == 0 else 1
 
 
@@ -839,9 +865,7 @@ def run_scan(
     ):
         return 1
 
-    if len(hosts) == 1:
-        return scan_one_host(hosts[0], args)
-    return scan_host_list(hosts, args)
+    return scan_hosts(hosts, args)
 
 
 def resolve_scan_targets(
@@ -932,10 +956,14 @@ def add_discover_parser(subparsers: argparse._SubParsersAction) -> None:
     )
     parser.add_argument(
         "--concurrency",
-        default=100,
-        type=positive_int,
+        default=DEFAULT_CONCURRENCY,
+        type=concurrency_value,
         metavar="N",
-        help="số luồng dò song song (mặc định: 100)",
+        help=(
+            f"số luồng dò song song, từ 1 đến {format_attempts(MAX_CONCURRENCY)} "
+            f"(mặc định: {DEFAULT_CONCURRENCY}; trên "
+            f"{format_attempts(CONCURRENCY_WARN)} luồng sẽ cảnh báo)"
+        ),
     )
     parser.add_argument(
         "--output",
@@ -1016,10 +1044,14 @@ def add_scan_arguments(
     )
     parser.add_argument(
         "--workers",
-        default=100,
-        type=positive_int,
+        default=DEFAULT_CONCURRENCY,
+        type=concurrency_value,
         metavar="N",
-        help="số luồng quét song song (mặc định: 100)",
+        help=(
+            f"số luồng quét song song, từ 1 đến {format_attempts(MAX_CONCURRENCY)} "
+            f"(mặc định: {DEFAULT_CONCURRENCY}; trên "
+            f"{format_attempts(CONCURRENCY_WARN)} luồng sẽ cảnh báo)"
+        ),
     )
     parser.add_argument(
         "--force",

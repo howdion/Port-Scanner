@@ -342,9 +342,9 @@
           </div>
           <div class="field">
             <label for="discover-concurrency">Số luồng dò song song</label>
-            <input id="discover-concurrency" type="number" min="1" max="100" step="1"
+            <input id="discover-concurrency" type="number" min="1" max="10000" step="1"
                    placeholder="100" inputmode="numeric" autocomplete="off">
-            <p class="hint">Từ 1 đến 100. Mặc định 100.</p>
+            <p id="discover-concurrency-hint" class="hint">Từ 1 đến 10.000. Mặc định 100.</p>
           </div>
         </div>
         <p id="discover-advanced-error" class="field-error" role="alert" hidden></p>
@@ -437,9 +437,9 @@
           </div>
           <div class="field">
             <label for="scan-concurrency">Số luồng quét song song</label>
-            <input id="scan-concurrency" type="number" min="1" max="100" step="1"
+            <input id="scan-concurrency" type="number" min="1" max="10000" step="1"
                    placeholder="100" inputmode="numeric" autocomplete="off">
-            <p class="hint">Từ 1 đến 100. Mặc định 100.</p>
+            <p id="scan-concurrency-hint" class="hint">Từ 1 đến 10.000. Mặc định 100.</p>
           </div>
         </div>
         <p id="scan-advanced-error" class="field-error" role="alert" hidden></p>
@@ -506,7 +506,8 @@
   var PORT_MAX = 65535;
   var MIN_TIMEOUT = 0.05;
   var MAX_TIMEOUT = 10;
-  var MAX_CONCURRENCY = 100;
+  var MAX_CONCURRENCY = 10000;
+  var CONCURRENCY_WARN = 2000;
   var CIDR_MIN_PREFIX = 18;
 
   // Các dải nội bộ được phép, giống _INTERNAL_NETWORKS bên server.
@@ -758,6 +759,7 @@
     discoveryPorts: el("discovery-ports"),
     discoveryTimeout: el("discovery-timeout"),
     discoverConcurrency: el("discover-concurrency"),
+    discoverConcurrencyHint: el("discover-concurrency-hint"),
     discoverAdvancedError: el("discover-advanced-error"),
     discoverStart: el("discover-start"),
     discoverCancel: el("discover-cancel"),
@@ -789,6 +791,7 @@
     timeout: el("timeout"),
     bannerTimeout: el("banner-timeout"),
     scanConcurrency: el("scan-concurrency"),
+    scanConcurrencyHint: el("scan-concurrency-hint"),
     scanAdvancedError: el("scan-advanced-error"),
     scanStart: el("scan-start"),
     scanCancel: el("scan-cancel"),
@@ -901,6 +904,19 @@
     }
     var value = Number(raw);
     return isFinite(value) ? value : NaN;
+  }
+
+  function updateConcurrencyHint(input, hint) {
+    // Chỉ là cảnh báo phía client; server vẫn kiểm tra lại và trả warnings.
+    var value = readNumber(input, fieldDefault(input));
+    if (isFinite(value) && value > CONCURRENCY_WARN) {
+      hint.textContent = "CẢNH BÁO: " + formatNumber(Math.round(value)) +
+        " luồng, vượt mốc " + formatNumber(CONCURRENCY_WARN) +
+        " — nhiều luồng có thể làm cạn cổng tạm của máy.";
+      return;
+    }
+    hint.textContent = "Từ 1 đến " + formatNumber(MAX_CONCURRENCY) +
+      ". Mặc định 100.";
   }
 
   // ------------------------------------------------------------------
@@ -1288,6 +1304,7 @@
     setProgress(ui.discoverBar, progress.done || 0, progress.total || 0);
     ui.discoverStatus.textContent = STATUS_TEXT[job.status] || job.status;
     ui.discoverPhase.textContent = job.message || "";
+    appendConcurrencyWarning(ui.discoverPhase, job);
     hide(ui.discoverAlert);
 
     if (job.status === "running") {
@@ -1452,36 +1469,24 @@
     }
   }
 
-  function batchText(job) {
-    var batch = job.batch;
-    if (!batch || !batch.total) {
-      return "";
-    }
-    var text = "Lô " + batch.index + "/" + batch.total;
-    if (batch.port_range) {
-      text += " (cổng " + batch.port_range + ")";
-    }
-    return text;
-  }
-
   function phaseCountText(job) {
-    var batch = job.batch;
-    if (batch && batch.ports_total) {
-      return "Đã quét " + formatNumber(batch.ports_done || 0) + "/" +
-        formatNumber(batch.ports_total) + " cổng";
-    }
     var progress = job.progress || {};
     return "Đã quét " + formatNumber(progress.done || 0) + "/" +
       formatNumber(progress.total || 0) + " cổng";
   }
 
   function progressRatio(job) {
-    var batch = job.batch;
-    if (batch && batch.ports_total) {
-      return {done: batch.ports_done || 0, total: batch.ports_total};
-    }
     var progress = job.progress || {};
     return {done: progress.done || 0, total: progress.total || 0};
+  }
+
+  function appendConcurrencyWarning(element, job) {
+    var warnings = job.warnings || [];
+    if (!warnings.length) {
+      return;
+    }
+    element.textContent = (element.textContent ? element.textContent + " · " : "") +
+      String(warnings[0]);
   }
 
   function scanParamsText(job) {
@@ -1578,7 +1583,11 @@
     var ratio = progressRatio(job);
     setProgress(ui.scanBar, ratio.done, ratio.total);
     ui.scanStatus.textContent = STATUS_TEXT[job.status] || job.status;
-    var parts = [batchText(job), phaseCountText(job)];
+    var parts = [phaseCountText(job)];
+    var warnings = job.warnings || [];
+    if (warnings.length) {
+      parts.push(String(warnings[0]));
+    }
     ui.scanPhase.textContent = parts.filter(Boolean).join(" · ");
     ui.scanParams.textContent = scanParamsText(job);
     hide(ui.scanAlert);
@@ -1765,6 +1774,7 @@
     refreshDiscoverPreview(true);
   });
   ui.discoverConcurrency.addEventListener("input", function () {
+    updateConcurrencyHint(ui.discoverConcurrency, ui.discoverConcurrencyHint);
     refreshDiscoverPreview(true);
   });
   ui.ports.addEventListener("input", function () {
@@ -1777,6 +1787,7 @@
     refreshScanPreview(true);
   });
   ui.scanConcurrency.addEventListener("input", function () {
+    updateConcurrencyHint(ui.scanConcurrency, ui.scanConcurrencyHint);
     refreshScanPreview(true);
   });
 

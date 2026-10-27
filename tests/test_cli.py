@@ -1,7 +1,7 @@
 """Kiểm thử CLI hai giai đoạn: `discover` tách rời `scan`.
 
-Mọi bài kiểm thử đều thay `discover_hosts`/`scan_ports`/`grab_banners` bằng
-mock nên không mở kết nối mạng nào và chạy rất nhanh.
+Mọi bài kiểm thử đều thay `discover_hosts`/`scan_targets` bằng mock nên không mở
+kết nối mạng nào và chạy rất nhanh.
 """
 
 from __future__ import annotations
@@ -35,6 +35,31 @@ class CliTestCase(unittest.TestCase):
         self.workdir.mkdir(parents=True, exist_ok=True)
         self.addCleanup(shutil.rmtree, self.workdir, True)
 
+    def fake_scan(self, open_ports: list[int]):
+        """Giả lập `scan_targets`: gọi callback đúng như bản thật."""
+
+        def run(
+            targets,
+            *,
+            total: int,
+            workers: int = 100,
+            timeout: float = 1.0,
+            banner_timeout: float = 0.5,
+            on_result=None,
+            on_progress=None,
+            should_cancel=None,
+        ):
+            pairs = list(targets)
+            self.scan_targets.extend(pairs)
+            for index, (host, port) in enumerate(pairs, start=1):
+                if on_progress is not None:
+                    on_progress(index, total)
+                if port in open_ports and on_result is not None:
+                    on_result(host, port, None)
+            return [], []
+
+        return run
+
     def invoke(
         self,
         argv: list[str],
@@ -43,13 +68,14 @@ class CliTestCase(unittest.TestCase):
     ) -> tuple[int, str]:
         """Chạy CLI; trả về (mã thoát, toàn bộ stdout)."""
         output = io.StringIO()
+        self.scan_targets: list[tuple[str, int]] = []
         self.discover_mock = mock.Mock(return_value=list(live_hosts or []))
-        self.scan_mock = mock.Mock(return_value=(list(open_ports or []), []))
-        self.banner_mock = mock.Mock(return_value={})
+        self.scan_mock = mock.Mock(
+            side_effect=self.fake_scan(list(open_ports or []))
+        )
         with mock.patch.object(sys, "argv", ["main.py", *argv]), \
                 mock.patch.object(main, "discover_hosts", self.discover_mock), \
-                mock.patch.object(main, "scan_ports", self.scan_mock), \
-                mock.patch.object(main, "grab_banners", self.banner_mock), \
+                mock.patch.object(main, "scan_targets", self.scan_mock), \
                 mock.patch.object(main, "stdin_is_interactive", return_value=False), \
                 contextlib.redirect_stdout(output), \
                 contextlib.redirect_stderr(io.StringIO()):
@@ -140,7 +166,7 @@ class ScanCommandTest(CliTestCase):
 
         self.assertEqual(code, 0)
         self.scan_mock.assert_called_once()
-        self.assertEqual(self.scan_mock.call_args.args[0], "127.0.0.1")
+        self.assertEqual(self.scan_targets, [("127.0.0.1", 135), ("127.0.0.1", 445)])
         self.assertIn("Cổng mở trên 127.0.0.1", text)
 
     def test_scan_hosts_option(self) -> None:
@@ -149,7 +175,9 @@ class ScanCommandTest(CliTestCase):
         )
 
         self.assertEqual(code, 0)
-        self.assertEqual(self.scan_mock.call_count, 2)
+        self.assertEqual(
+            self.scan_targets, [("127.0.0.1", 135), ("127.0.0.2", 135)]
+        )
         self.assertIn("Tổng cộng: 2 host", text)
 
     def test_scan_reads_hosts_file(self) -> None:
@@ -166,7 +194,9 @@ class ScanCommandTest(CliTestCase):
         )
 
         self.assertEqual(code, 0)
-        self.assertEqual(self.scan_mock.call_count, 2)
+        self.assertEqual(
+            self.scan_targets, [("127.0.0.1", 135), ("127.0.0.3", 135)]
+        )
         self.assertIn("Tổng cộng: 2 host", text)
 
     def test_scan_rejects_external_host_in_list(self) -> None:
@@ -224,6 +254,69 @@ class ScanCommandTest(CliTestCase):
         self.scan_mock.assert_not_called()
 
 
+class ConcurrencyOptionTest(CliTestCase):
+    """Trần concurrency 10.000 và cảnh báo mềm từ 2.000 luồng."""
+
+    def test_scan_accepts_max_concurrency(self) -> None:
+        code, _ = self.invoke(
+            ["scan", "127.0.0.1", "--ports", "135", "--workers", "10000"]
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.scan_mock.call_args.kwargs["workers"], 10000)
+
+    def test_scan_rejects_concurrency_above_cap(self) -> None:
+        with self.assertRaises(SystemExit) as caught:
+            self.invoke(
+                ["scan", "127.0.0.1", "--ports", "135", "--workers", "10001"]
+            )
+
+        self.assertEqual(caught.exception.code, 2)
+        self.scan_mock.assert_not_called()
+
+    def test_scan_warns_above_warning_threshold(self) -> None:
+        code, text = self.invoke(
+            ["scan", "127.0.0.1", "--ports", "135", "--workers", "2001"]
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.scan_mock.call_args.kwargs["workers"], 2001)
+        self.assertIn("2.001 luồng", text)
+        self.assertIn("cạn cổng tạm", text)
+        # Vượt mốc cảnh báo nhưng KHÔNG bị chặn.
+        self.assertNotIn("--confirm-large-scan", text)
+
+    def test_no_warning_at_threshold(self) -> None:
+        _, text = self.invoke(
+            ["scan", "127.0.0.1", "--ports", "135", "--workers", "2000"]
+        )
+
+        self.assertNotIn("CẢNH BÁO", text)
+
+    def test_discover_accepts_max_concurrency(self) -> None:
+        code, _ = self.invoke(
+            ["discover", "127.0.0.0/28", "--concurrency", "10000"]
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.discover_mock.call_args.kwargs["workers"], 10000)
+
+    def test_discover_rejects_concurrency_above_cap(self) -> None:
+        with self.assertRaises(SystemExit) as caught:
+            self.invoke(["discover", "127.0.0.0/28", "--concurrency", "10001"])
+
+        self.assertEqual(caught.exception.code, 2)
+        self.discover_mock.assert_not_called()
+
+    def test_discover_warns_above_warning_threshold(self) -> None:
+        code, text = self.invoke(
+            ["discover", "127.0.0.0/28", "--concurrency", "3000"]
+        )
+
+        self.assertEqual(code, 0)
+        self.assertIn("3.000 luồng", text)
+
+
 class BackwardCompatibilityTest(CliTestCase):
     """Cách gọi cũ `main.py <IP>` vẫn chạy như `scan` với một IP đơn."""
 
@@ -234,7 +327,9 @@ class BackwardCompatibilityTest(CliTestCase):
 
         self.assertEqual(code, 0)
         self.scan_mock.assert_called_once()
-        self.assertEqual(self.scan_mock.call_args.args[0], "127.0.0.1")
+        self.assertEqual(
+            self.scan_targets, [("127.0.0.1", 135), ("127.0.0.1", 445)]
+        )
         self.assertNotIn(main.STAGE_LABELS[main.STAGE_DISCOVERY], text)
 
     def test_no_arguments_scans_localhost(self) -> None:
@@ -242,7 +337,9 @@ class BackwardCompatibilityTest(CliTestCase):
 
         self.assertEqual(code, 0)
         self.scan_mock.assert_called_once()
-        self.assertEqual(self.scan_mock.call_args.args[0], "127.0.0.1")
+        self.assertEqual(
+            {host for host, _ in self.scan_targets}, {"127.0.0.1"}
+        )
 
     def test_legacy_cidr_is_rejected_with_hint(self) -> None:
         code, text = self.invoke(["127.0.0.0/24", "--ports", "135"])

@@ -829,7 +829,8 @@ class ScanResultTest(WebServerTestCase):
         self.assertEqual(document["metadata"]["target"], "127.0.0.1")
         self.assertEqual(document["metadata"]["target_hosts"], ["127.0.0.1"])
         self.assertEqual(document["metadata"]["hosts_count"], 1)
-        self.assertIn("batches_total", document["metadata"])
+        self.assertEqual(document["metadata"]["port_range"], str(fake.port))
+        self.assertNotIn("batches_total", document["metadata"])
         self.assertNotIn(b"Traceback", raw)
 
     def test_multi_host_scan_returns_all_hosts(self) -> None:
@@ -938,106 +939,95 @@ class ScanResultTest(WebServerTestCase):
         self.assertEqual(status, 404)
 
 
-class BatchScanTest(WebServerTestCase):
-    """Quét theo lô: chia cổng, kết quả từng phần, hủy giữa các lô."""
+class StreamingScanTest(WebServerTestCase):
+    """Quét một lượt: tiến độ theo từng cổng, kết quả hiện ngay, hủy giữ kết quả."""
 
-    def test_single_batch_for_exactly_one_batch_of_ports(self) -> None:
+    def test_progress_counts_every_port(self) -> None:
         with mock.patch.object(scanner, "scan_port", side_effect=self.fake_scan), \
                 mock.patch.object(scanner, "grab_banner", return_value=None):
-            job_id = self.start_scan(["127.0.0.1"], f"1-{web_server.BATCH_SIZE}")
+            job_id = self.start_scan(["127.0.0.1"], "1-400")
             snapshot = self.wait_done(web_server.KIND_SCAN, job_id)
 
-        self.assertEqual(snapshot["batch"]["total"], 1)
-        self.assertEqual(snapshot["batch"]["index"], 1)
-        self.assertEqual(snapshot["batch"]["ports_total"], web_server.BATCH_SIZE)
-        self.assertEqual(snapshot["batch"]["ports_done"], web_server.BATCH_SIZE)
-
-    def test_two_batches_at_boundary(self) -> None:
-        with mock.patch.object(scanner, "scan_port", side_effect=self.fake_scan), \
-                mock.patch.object(scanner, "grab_banner", return_value=None):
-            job_id = self.start_scan(
-                ["127.0.0.1"], f"1-{web_server.BATCH_SIZE + 1}"
-            )
-            snapshot = self.wait_done(web_server.KIND_SCAN, job_id)
-
-        self.assertEqual(snapshot["batch"]["total"], 2)
-        self.assertEqual(snapshot["batch"]["port_range"], "2049")
         self.assertEqual(snapshot["status"], "done")
+        self.assertNotIn("batch", snapshot, "không còn khái niệm lô")
+        self.assertEqual(snapshot["progress"]["total"], 400)
+        self.assertEqual(snapshot["progress"]["done"], 400)
+        self.assertEqual(snapshot["progress"]["percent"], 100.0)
+        self.assertEqual(
+            sorted(r["port"] for r in snapshot["results"]), [135]
+        )
 
-    def test_discrete_ports_are_split_correctly(self) -> None:
-        # 3 cổng rời (22, 80, 443) + 2501 cổng liền (3000-5500) = 2504 cổng.
+    def test_progress_total_is_hosts_times_ports(self) -> None:
         with mock.patch.object(scanner, "scan_port", side_effect=self.fake_scan), \
                 mock.patch.object(scanner, "grab_banner", return_value=None):
-            job_id = self.start_scan(["127.0.0.1"], "22,80,443,3000-5500")
+            job_id = self.start_scan(["127.0.0.1", "127.0.0.2"], "135,445,8080")
             snapshot = self.wait_done(web_server.KIND_SCAN, job_id)
 
-        self.assertEqual(snapshot["batch"]["total"], 2)
-        self.assertEqual(snapshot["batch"]["ports_total"], 2504)
-        self.assertEqual(snapshot["batch"]["port_range"], "5045-5500")
+        self.assertEqual(snapshot["progress"]["total"], 6)
+        self.assertEqual(snapshot["progress"]["done"], 6)
 
-    def test_results_appear_after_first_batch(self) -> None:
-        seen_batches: list[int] = []
-        partial_results: list[list[int]] = []
+    def test_results_appear_while_running(self) -> None:
+        seen_while_running: list[list[int]] = []
 
         with mock.patch.object(scanner, "scan_port", side_effect=self.slow_fake_scan), \
                 mock.patch.object(scanner, "grab_banner", return_value=None):
-            job_id = self.start_scan(["127.0.0.1"], "1-4096")
+            job_id = self.start_scan(["127.0.0.1"], "1-400", concurrency=4)
+
             deadline = time.time() + 60
             snapshot: dict = {}
             while time.time() < deadline:
                 _, _, raw = self.request("GET", f"/api/scan/{job_id}")
                 snapshot = json.loads(raw)
-                index = (snapshot.get("batch") or {}).get("index", 0)
-                if index and index not in seen_batches:
-                    seen_batches.append(index)
-                if snapshot["status"] == "running":
-                    ports = sorted(r["port"] for r in snapshot["results"])
-                    if ports:
-                        partial_results.append(ports)
-                else:
+                if snapshot["status"] != "running":
+                    break
+                ports = sorted(r["port"] for r in snapshot["results"])
+                if ports:
+                    seen_while_running.append(ports)
+                    self.assertLess(
+                        snapshot["progress"]["done"],
+                        snapshot["progress"]["total"],
+                        "kết quả phải hiện khi job còn đang chạy",
+                    )
                     break
                 time.sleep(0.05)
 
-        self.assertEqual(snapshot["status"], "done")
-        self.assertEqual(seen_batches, [1, 2], "phải đi qua lô 1 rồi lô 2")
-        self.assertTrue(
-            any(ports == [135, 445] for ports in partial_results),
-            f"kết quả lô 1 phải xuất hiện khi job còn chạy: {partial_results}",
-        )
-        self.assertEqual(snapshot["batch"]["ports_done"], 4096)
+            self.cancel_if_running(web_server.KIND_SCAN, job_id)
+            self.wait_done(web_server.KIND_SCAN, job_id, timeout=60)
 
-    def test_cancel_between_batches_keeps_finished_results(self) -> None:
+        self.assertTrue(seen_while_running, "phải thấy kết quả trước khi quét xong")
+        self.assertIn(135, seen_while_running[0])
+
+    def test_cancel_keeps_finished_results(self) -> None:
         with mock.patch.object(scanner, "scan_port", side_effect=self.slow_fake_scan), \
                 mock.patch.object(scanner, "grab_banner", return_value=None):
-            job_id = self.start_scan(["127.0.0.1"], "1-4096")
+            job_id = self.start_scan(["127.0.0.1"], "1-400", concurrency=2)
 
-            # Chờ lô 1 xong (job đã sang lô 2) rồi hủy.
+            # Chờ tới khi đã có ít nhất một cổng mở rồi mới hủy.
             deadline = time.time() + 60
             while time.time() < deadline:
                 _, _, raw = self.request("GET", f"/api/scan/{job_id}")
-                if (json.loads(raw).get("batch") or {}).get("index", 0) >= 2:
+                if json.loads(raw)["results"]:
                     break
                 time.sleep(0.05)
             self.cancel(web_server.KIND_SCAN, job_id)
             snapshot = self.wait_done(web_server.KIND_SCAN, job_id, timeout=60)
 
         self.assertEqual(snapshot["status"], "cancelled")
-        self.assertEqual(snapshot["batch"]["completed"], 1)
-        self.assertEqual(
-            sorted(r["port"] for r in snapshot["results"]),
-            [135, 445],
-            "kết quả của lô đã xong phải được giữ lại",
+        self.assertTrue(snapshot["results"], "kết quả đã quét phải được giữ lại")
+        self.assertIn(
+            135,
+            [r["port"] for r in snapshot["results"]],
+            "cổng mở đã tìm thấy trước khi hủy phải còn trong kết quả",
         )
 
     def test_download_while_running_returns_partial_results(self) -> None:
-        with mock.patch.object(scanner, "scan_port", side_effect=self.slow_fake_scan), \
-                mock.patch.object(scanner, "grab_banner", return_value=None):
-            job_id = self.start_scan(["127.0.0.1"], "1-4096", concurrency=5)
+        with mock.patch.object(scanner, "scan_port", side_effect=self.slow_scan):
+            job_id = self.start_scan(["127.0.0.1"], "1-400", concurrency=2)
 
             deadline = time.time() + 60
             while time.time() < deadline:
                 _, _, raw = self.request("GET", f"/api/scan/{job_id}")
-                if (json.loads(raw).get("batch") or {}).get("ports_done", 0) >= 1:
+                if json.loads(raw)["progress"]["done"] >= 1:
                     break
                 time.sleep(0.05)
 
@@ -1048,14 +1038,16 @@ class BatchScanTest(WebServerTestCase):
             )
             self.assertEqual(status, 200)
             document = json.loads(download)
+            self.assertEqual(set(document), {"metadata", "results"})
+            self.assertNotIn("batches_total", document["metadata"])
             self.assertEqual(
-                document["metadata"]["batches_total"], 2
+                document["metadata"]["total_open_ports"], len(document["results"])
             )
 
             self.cancel_if_running(web_server.KIND_SCAN, job_id)
             self.wait_done(web_server.KIND_SCAN, job_id, timeout=60)
 
-    def test_batch_fields_present_in_cancel_response(self) -> None:
+    def test_cancel_response_has_progress_not_batch(self) -> None:
         with mock.patch.object(scanner, "scan_port", side_effect=self.slow_scan):
             job_id = self.start_scan(["127.0.0.1"], "1-400", concurrency=1)
             status, _, raw = self.request(
@@ -1065,8 +1057,9 @@ class BatchScanTest(WebServerTestCase):
             body = json.loads(raw)
             self.assertTrue(body["cancelled"])
             payload = body["job"]
-            self.assertIn("batch", payload)
-            self.assertIn("ports_total", payload["batch"])
+            self.assertIn("progress", payload)
+            self.assertNotIn("batch", payload)
+            self.assertEqual(payload["progress"]["total"], 400)
             self.wait_done(web_server.KIND_SCAN, job_id, timeout=60)
 
 

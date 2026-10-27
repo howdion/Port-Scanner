@@ -235,8 +235,7 @@ class CliStageSeparationTest(unittest.TestCase):
         scan = mock.Mock(return_value=([], []))
         with mock.patch.object(sys, "argv", ["main.py", *argv]), \
                 mock.patch.object(main, "discover_hosts", discover), \
-                mock.patch.object(main, "scan_ports", scan), \
-                mock.patch.object(main, "grab_banners", return_value={}), \
+                mock.patch.object(main, "scan_targets", scan), \
                 mock.patch.object(main, "stdin_is_interactive", return_value=False), \
                 contextlib.redirect_stdout(output):
             code = main.main()
@@ -310,7 +309,8 @@ class CliStageSeparationTest(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertIn("917.490", text)
-        self.assertEqual(scan.call_count, 14)
+        # Một lượt quét streaming duy nhất cho toàn bộ danh sách host.
+        self.assertEqual(scan.call_count, 1)
 
 
 if __name__ == "__main__":
