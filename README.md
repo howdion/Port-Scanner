@@ -37,7 +37,7 @@ Port Scanner/
 ├── web_server.py      # web server cục bộ, chỉ bind 127.0.0.1
 ├── README.md
 ├── tests/             # kiểm thử tự động bằng unittest
-│   ├── test_batching.py
+│   ├── test_streaming.py
 │   ├── test_cli.py
 │   ├── test_limits.py
 │   ├── test_parsing.py
@@ -62,8 +62,10 @@ python -m unittest discover tests
 - `tests/test_report.py`: dựng và ghi báo cáo JSON/CSV, xử lý ký tự đặc biệt trong banner.
 - `tests/test_web_server.py`: API của web server — token, Host/Origin, giới hạn mục tiêu,
   giới hạn số cổng và số luồng, hai lần quét cùng lúc, hủy quét, banner chứa HTML,
-  quét theo lô (chia lô, kết quả từng phần, hủy giữa các lô, giới hạn theo từng giai đoạn).
-- `tests/test_batching.py`: hàm chia lô cổng, đếm host của mục tiêu, sắp xếp kết quả theo IP.
+  quét một lượt kiểu streaming (kết quả trả ngay từng cổng, hủy giữa chừng vẫn giữ
+  kết quả đã có, giới hạn theo từng giai đoạn).
+- `tests/test_streaming.py`: hàm `scan_targets` (kết quả streaming, hủy, lỗi mạng,
+  tiến độ), đếm host của mục tiêu, sắp xếp kết quả theo IP, trần concurrency.
 - `tests/test_limits.py`: hai mốc giới hạn cho từng giai đoạn, các hàm ước tính lượt và
   ước tính thời gian, định dạng số/thời gian, thông báo lỗi và giới hạn của CLI.
 - `tests/test_cli.py`: hai subcommand `discover`/`scan`, `--hosts`/`--hosts-file`, từ
@@ -111,7 +113,7 @@ Chỉ dò host sống, **không** quét cổng.
 | `CIDR` | bắt buộc | Dải CIDR từ /18 đến /32, ví dụ `192.168.1.0/24`. |
 | `--discovery-ports` | `22,80,135,443,445` | Cổng dùng để dò host sống. |
 | `--discovery-timeout` | `0.3` | Thời gian chờ mỗi lần thử khi dò, tính bằng giây. |
-| `--concurrency` | `100` | Số luồng dò song song. |
+| `--concurrency` | `100` | Số luồng dò song song, từ 1 đến 10.000; trên 2.000 luồng sẽ in cảnh báo (vẫn chạy). |
 | `--output` | không ghi file | Ghi JSON `{cidr, discovery_ports, discovered_at, live_hosts}`; nếu chỉ ghi tên file thì đặt trong `reports/`. |
 | `--force` | không bật | Ghi đè file kết quả đã tồn tại mà không hỏi. |
 | `--yes` | không bật | Tự xác nhận dò CIDR ngoài dải nội bộ (vẫn in cảnh báo). |
@@ -130,7 +132,7 @@ nguồn host: `IP`, `--hosts`, `--hosts-file`.
 | `--ports` | `1-1024` | Dải cổng hoặc danh sách cổng, ví dụ `1-1024`, `22,80,443`, `8000-8100`; tối đa `1-65535`. |
 | `--timeout` | `1.0` | Thời gian chờ tối đa cho mỗi kết nối, tính bằng giây. |
 | `--banner-timeout` | `0.5` | Thời gian chờ đọc banner cho mỗi cổng mở, tính bằng giây. |
-| `--workers` | `100` | Số luồng quét song song. |
+| `--workers` | `100` | Số luồng quét song song, từ 1 đến 10.000; trên 2.000 luồng sẽ in cảnh báo (vẫn chạy). |
 | `--force` | không bật | Ghi đè file báo cáo đã tồn tại mà không hỏi. |
 | `--yes` | không bật | Tự xác nhận mục tiêu ngoài dải nội bộ (vẫn in cảnh báo). |
 | `--confirm-large-scan` | không bật | Tự xác nhận khi giai đoạn quét vượt mốc `500.000` lượt. |
@@ -309,8 +311,8 @@ thư mục này được tạo tự động.
   - `target_hosts` — **danh sách host thật đã quét** (mới), ví dụ
     `["127.0.0.1", "127.0.0.2"]`, đúng thứ tự gửi lên, không trùng;
   - `hosts_count` — số host trong `target_hosts`;
-  - `port_range`, `total_open_ports`, `scan_duration_seconds` như cũ; bản tải từ
-    web có thêm `batches_completed` và `batches_total`.
+  - `port_range`, `total_open_ports`, `scan_duration_seconds` như cũ. Bản tải từ
+    web dùng đúng bộ metadata này, không còn trường riêng cho lô.
 - CSV có các cột `host,port,protocol,service,banner,scanned_at`; module `csv`
   tự quote banner có dấu phẩy, xuống dòng hoặc dấu nháy. File dùng UTF-8. CSV không
   có phần metadata, chỉ có các dòng kết quả.
@@ -396,7 +398,8 @@ Trang có **hai khối độc lập**, xếp theo đúng thứ tự công việc
   `Lượt dò (ước tính): 1.270 (254 host × 5 cổng dò) · khoảng 4 giây`. Dòng này tự
   đổi màu khi vượt mốc (vàng: cần xác nhận, đỏ: vượt trần cứng).
 - **Tùy chọn nâng cao** (thu gọn): `discovery_ports`, `discovery_timeout`,
-  `concurrency` — placeholder là giá trị mặc định của server.
+  `concurrency` (tối đa 10.000; trên 2.000 luồng hiện cảnh báo cạn cổng tạm) —
+  placeholder là giá trị mặc định của server.
 - Nút **Dò host sống** / **Hủy dò**, thanh tiến độ và thời gian chạy riêng.
 - Kết quả là **bảng danh sách host sống**, mỗi dòng có checkbox, kèm hai nút
   **Chọn tất cả** / **Bỏ chọn tất cả** và dòng "Đã chọn N/M host sống". Mặc định
@@ -410,7 +413,9 @@ Trang có **hai khối độc lập**, xếp theo đúng thứ tự công việc
   xuất hiện: bấm nút này thì khối quét dùng đúng danh sách đang tick trong bảng
   (gõ tay vào ô host sẽ quay lại chế độ nhập tay).
 - **Dải cổng** kèm ba chip `Phổ biến`, `1-1024`, `Web`; nhận tới `1-65535`.
-- **Tùy chọn nâng cao** (thu gọn): `timeout`, `banner_timeout`, `concurrency`.
+- **Tùy chọn nâng cao** (thu gọn): `timeout`, `banner_timeout`, `concurrency`;
+  trên 2.000 luồng giao diện hiện cảnh báo cạn cổng tạm, server cũng trả cảnh báo đó
+  trong `warnings` của job nhưng **không chặn**.
 
   | Trường | Tham số API | Mặc định | Giới hạn server kiểm tra |
   | --- | --- | --- | --- |
@@ -418,7 +423,7 @@ Trang có **hai khối độc lập**, xếp theo đúng thứ tự công việc
   | Timeout đọc banner (giây) | `banner_timeout` | `0.5` | `0.05`–`10` |
   | Timeout dò host (giây) | `discovery_timeout` | `0.3` | `0.05`–`10` |
   | Cổng dò host sống | `discovery_ports` | `22,80,135,443,445` | dải cổng hợp lệ, tối đa 64 cổng |
-  | Số luồng song song | `concurrency` | `100` | `1`–`100` |
+  | Số luồng song song | `concurrency` | `100` | `1`–`10.000` (cảnh báo trên `2.000`) |
 
   Để trống một trường nghĩa là dùng mặc định. Giao diện kiểm tra định dạng và khoảng
   để hỗ trợ nhập liệu, nhưng **server luôn kiểm tra lại** và là nơi quyết định.
@@ -439,23 +444,26 @@ Kiểm tra phía giao diện chỉ để giúp nhập liệu nhanh; mọi giới
 server quyết định. Trang không dùng `innerHTML` hay bất kỳ cách chèn HTML nào: mọi
 dữ liệu từ server (host, banner) đều vào DOM bằng `textContent`.
 
-### Quét theo lô
+### Quét một lượt, kết quả trả ngay
 
-Mỗi job có thể nhận tối đa `65535` cổng. Server tự chia danh sách cổng (đã sắp xếp
-và loại trùng) thành các **lô liên tiếp**, mỗi lô tối đa **2048** cổng, rồi quét
-lần lượt từng lô:
+Mỗi job `scan` có thể nhận tối đa `65535` cổng và **không còn chia lô**. Toàn bộ
+cặp `(host, cổng)` vào cùng một lượt quét: cổng nào xong trước được ghi vào job
+ngay, nên API polling trả về kết quả tích luỹ mà không phải chờ hết một nhóm.
 
-- Ví dụ nhập `1-4096` sẽ chạy lô 1 (`1-2048`), hiện kết quả, rồi mới chạy lô 2
-  (`2049-4096`).
+- Ví dụ nhập `1-4096`: kết quả hiện dần theo đúng thứ tự quét xong, không có mốc
+  "lô 1 xong" rồi mới tới lô 2.
+- Task được nạp dần vào một cửa sổ giới hạn (khoảng hai lần số luồng) chứ không
+  dựng sẵn hàng trăm nghìn `Future`, nên bộ nhớ vẫn ổn định với `1-65535`.
 - Job `scan` chỉ quét cổng trên danh sách host client gửi lên; bước dò host sống
   là **job `discover` riêng**, không tự chạy kèm.
-- Sau mỗi lô, kết quả được gộp ngay vào job nên API polling trả về được **kết quả
-  từng phần**. Kết quả luôn sắp xếp theo IP (so sánh số) rồi theo cổng.
-- Hủy quét có hiệu lực cả giữa các lô lẫn trong lô đang chạy: job chuyển
-  `cancelled`, kết quả của các lô đã xong được giữ nguyên và vẫn tải về được.
+- Tiến độ là `progress.done / progress.total` trên **toàn bộ** lượt quét
+  (`số host × số cổng`), không phải tiến độ trong một lô.
+- Hủy quét: job chuyển `cancelled`, các cổng đã quét xong vẫn nằm trong kết quả
+  và vẫn tải về được.
+- Kết quả luôn sắp xếp theo IP (so sánh số) rồi theo cổng khi trả về.
 
-Hằng số kích thước lô nằm ở một chỗ duy nhất trong `web_server.py`
-(`BATCH_SIZE = 2048`).
+Cùng một hàm `scan_targets` được CLI và web dùng chung, nên hai nơi luôn có cùng
+cách quét và cùng cách xử lý hủy.
 
 ### API
 
@@ -530,16 +538,9 @@ curl.exe -s -X POST http://127.0.0.1:8000/api/scan `
   "ports": "1-4096",
   "status": "running",
   "phase": "scanning",
-  "message": "[1/1] 127.0.0.1: 512/2048 cổng",
-  "progress": { "done": 512, "total": 2048 },
-  "batch": {
-    "index": 1,
-    "total": 2,
-    "completed": 0,
-    "port_range": "1-2048",
-    "ports_done": 512,
-    "ports_total": 4096
-  },
+  "message": "Đã quét 512/4096 cổng, 2 cổng mở.",
+  "progress": { "done": 512, "total": 4096, "percent": 12.5 },
+  "warnings": [],
   "params": { "timeout": 1.0, "banner_timeout": 0.5, "concurrency": 100 },
   "started_at": "2026-10-26T12:00:00+07:00",
   "finished_at": null,
@@ -550,15 +551,15 @@ curl.exe -s -X POST http://127.0.0.1:8000/api/scan `
 }
 ```
 
-- `progress` là tiến độ **trong lô hiện tại**; `batch.ports_done / batch.ports_total`
-  là tiến độ **của cả job** (giao diện dùng số này cho thanh tiến độ).
-- `batch.completed` là số lô đã chạy xong.
+- `progress.done / progress.total` là tiến độ **của cả job** (`số host × số cổng`);
+  giao diện dùng số này cho thanh tiến độ và dòng "Đã quét A/B cổng".
+- `warnings` là danh sách cảnh báo **không chặn** (hiện chỉ có cảnh báo số luồng
+  cao); job vẫn chạy bình thường.
 - `target` là nhãn hiển thị: một IP khi `hosts` có đúng một phần tử, ngược lại
   `"N host"`.
 
 Metadata trong file tải về gồm `target` (nhãn), `target_hosts` (danh sách host thật),
-`hosts_count`, `port_range`, `total_open_ports`, `scan_duration_seconds`,
-`batches_completed` và `batches_total`.
+`hosts_count`, `port_range`, `total_open_ports` và `scan_duration_seconds`.
 
 **Chạy đồng thời.** Mỗi loại job chỉ cho một job chạy tại một thời điểm: gọi
 `/api/scan` khi đang có job scan sẽ nhận `409`, tương tự với `/api/discover`.
@@ -582,10 +583,12 @@ không lộ traceback.
   - **từng host** trong `hosts` của `/api/scan` cũng bị kiểm tra như vậy — trên web
     **không có** cơ chế xác nhận để quét mục tiêu ngoài;
   - CIDR lớn hơn `/18` bị từ chối;
-  - tối đa `65535` cổng mỗi job, chia thành các lô `2048` cổng;
+  - tối đa `65535` cổng mỗi job, quét một lượt và trả kết quả ngay từng cổng;
   - hai mốc giới hạn áp dụng riêng cho từng loại job (xem mục "Hai mốc giới hạn
     cho từng giai đoạn" bên dưới);
-  - tối đa `100` luồng; các timeout do server kiểm tra lại theo khoảng cho phép
+  - tối đa `10.000` luồng (mặc định `100`); trên `2.000` luồng server trả cảnh báo
+    trong `warnings` nhưng **không chặn**, vì quá nhiều luồng có thể làm cạn cổng
+    tạm của máy; các timeout do server kiểm tra lại theo khoảng cho phép
     (`0.05`–`10` giây) dù giao diện gửi lên giá trị nào;
   - mỗi loại job chỉ một cái chạy tại một thời điểm.
 - Chống bị trang web khác lợi dụng: kiểm tra header `Host` (chỉ nhận
@@ -648,6 +651,8 @@ gian chờ.
   không phải IPv4 hợp lệ hoặc nằm ngoài dải nội bộ bị từ chối hẳn, không có cờ nào
   bỏ qua.
 - Dải CIDR lớn hơn `/18` bị từ chối ngay, không hỏi lại.
+- Số luồng tối đa `10.000`; trên `2.000` luồng chỉ cảnh báo (có thể cạn cổng tạm của
+  máy) chứ không chặn, vì đây là lựa chọn của người chạy.
 - Mỗi giai đoạn vượt `500.000` lượt phải được xác nhận thêm (`--confirm-large-scan`
   trên CLI, hoặc bước xác nhận riêng trên web); giai đoạn nào vượt `5.000.000` lượt
   bị từ chối hẳn, không có cách vượt qua.
