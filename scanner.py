@@ -4,8 +4,14 @@ from __future__ import annotations
 
 import errno
 import socket
-from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Callable, Iterable
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    Future,
+    ThreadPoolExecutor,
+    as_completed,
+    wait,
+)
 
 
 # Các mã lỗi cho biết cổng đóng, bị lọc hoặc hết thời gian chờ.
@@ -64,62 +70,108 @@ def scan_port(host: str, port: int, timeout: float = 1.0) -> bool:
     raise OSError(result, f"Không thể kết nối tới {host}:{port} (mã lỗi {result})")
 
 
-def scan_ports(
+def _probe_target(
     host: str,
-    ports: list[int],
-    timeout: float = 1.0,
+    port: int,
+    timeout: float,
+    banner_timeout: float,
+) -> tuple[bool, str | None]:
+    """Quét một cổng và đọc banner ngay nếu cổng mở.
+
+    Trả về ``(mở, banner)``. Banner chỉ được đọc cho cổng đã mở nên không làm
+    chậm các cổng đóng. Lỗi mạng được để ném ra cho ``scan_targets`` ghi nhận.
+    """
+    if not scan_port(host, port, timeout):
+        return False, None
+    return True, grab_banner(host, port, banner_timeout)
+
+
+def scan_targets(
+    targets: Iterable[tuple[str, int]],
+    *,
+    total: int,
     workers: int = 100,
+    timeout: float = 1.0,
+    banner_timeout: float = 0.5,
+    on_result: Callable[[str, int, str | None], None] | None = None,
     on_progress: Callable[[int, int], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
-) -> tuple[list[int], list[tuple[int, str]]]:
-    """Quét nhiều cổng song song bằng thread pool.
+) -> tuple[list[tuple[str, int]], list[tuple[str, int, str]]]:
+    """Quét một lượt toàn bộ danh sách ``(host, cổng)``, trả kết quả ngay.
 
-    Mỗi luồng xử lý một cổng, giới hạn số luồng để không mở quá nhiều kết nối
-    cùng lúc. Các cổng đóng sẽ trả về nhanh hoặc chờ tối đa ``timeout`` giây,
-    nên chương trình không bị treo.
+    Không chia lô: task được nạp dần vào một cửa sổ giới hạn (khoảng hai lần số
+    luồng) để không tạo hàng triệu Future cùng lúc, nhưng mỗi cổng quét xong là
+    được trả về ngay qua ``on_result``, không chờ nhóm nào hoàn tất.
 
     Args:
-        host: Địa chỉ IPv4 của mục tiêu.
-        ports: Danh sách cổng cần quét.
-        timeout: Thời gian chờ tối đa cho mỗi kết nối (giây).
+        targets: Iterable các cặp ``(host, cổng)``; có thể là generator.
+        total: Tổng số lượt quét, dùng cho tiến độ ``done/total``.
         workers: Số luồng quét song song.
-        on_progress: Callback tùy chọn nhận (đã xong, tổng) sau mỗi cổng.
-        should_cancel: Callback tùy chọn; trả về True để dừng sớm và bỏ các cổng
-            còn đang xếp hàng. Kết quả đã quét được vẫn trả về bình thường.
+        timeout: Thời gian chờ tối đa cho mỗi lần kết nối (giây).
+        banner_timeout: Thời gian chờ đọc banner của một cổng mở (giây).
+        on_result: Callback nhận ``(host, cổng, banner)`` ngay khi tìm thấy cổng
+            mở; ``banner`` là ``None`` nếu không đọc được.
+        on_progress: Callback nhận ``(đã xong, tổng)`` sau mỗi cổng.
+        should_cancel: Callback trả về True để dừng sớm; kết quả đã có vẫn được
+            giữ nguyên và trả về.
 
     Returns:
-        Một tuple gồm danh sách cổng mở (đã sắp xếp) và danh sách lỗi mạng
-        dạng ``(cổng, thông báo)``.
+        Một tuple gồm danh sách ``(host, cổng)`` đang mở và danh sách lỗi mạng
+        dạng ``(host, cổng, thông báo)``.
     """
-    open_ports: list[int] = []
-    errors: list[tuple[int, str]] = []
-    total = len(ports)
+    open_ports: list[tuple[str, int]] = []
+    errors: list[tuple[str, int, str]] = []
     done = 0
-    cancelled = False
 
-    executor = ThreadPoolExecutor(max_workers=workers)
+    worker_count = max(1, min(workers, max(1, total)))
+    # Cửa sổ task chờ: đủ lớn để luôn có việc cho mọi luồng, nhưng có trần để
+    # không dựng hàng triệu Future khi danh sách cổng rất dài.
+    window = max(worker_count * 2, 64)
+
+    iterator = iter(targets)
+    pending: dict[Future[tuple[bool, str | None]], tuple[str, int]] = {}
+    exhausted = False
+
+    executor = ThreadPoolExecutor(max_workers=worker_count)
     try:
-        futures = {
-            executor.submit(scan_port, host, port, timeout): port
-            for port in ports
-        }
-        for future in as_completed(futures):
-            if should_cancel is not None and should_cancel():
-                cancelled = True
+        while True:
+            # Người dùng hủy: thôi nạp task mới, vẫn thu nốt kết quả đã xong.
+            cancelled = should_cancel is not None and should_cancel()
+            while not cancelled and not exhausted and len(pending) < window:
+                try:
+                    host, port = next(iterator)
+                except StopIteration:
+                    exhausted = True
+                    break
+                future = executor.submit(
+                    _probe_target, host, port, timeout, banner_timeout
+                )
+                pending[future] = (host, port)
+
+            if not pending:
                 break
-            port = futures[future]
-            try:
-                if future.result():
-                    open_ports.append(port)
-            except OSError as exc:
-                errors.append((port, str(exc)))
-            done += 1
-            if on_progress is not None:
-                on_progress(done, total)
+
+            finished, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in finished:
+                host, port = pending.pop(future)
+                try:
+                    is_open, banner = future.result()
+                except OSError as exc:
+                    errors.append((host, port, str(exc)))
+                else:
+                    if is_open:
+                        open_ports.append((host, port))
+                        if on_result is not None:
+                            on_result(host, port, banner)
+                done += 1
+                if on_progress is not None:
+                    on_progress(done, total)
+
+            if should_cancel is not None and should_cancel():
+                break
     finally:
-        # Khi hủy, cancel_futures bỏ các cổng chưa chạy; các luồng đang chạy
-        # vẫn kết thúc trong khoảng timeout nên không bị treo lâu.
-        executor.shutdown(wait=True, cancel_futures=cancelled)
+        # Các task đang chạy tự kết thúc trong khoảng timeout nên không treo lâu.
+        executor.shutdown(wait=True, cancel_futures=True)
 
     open_ports.sort()
     return open_ports, errors
@@ -257,35 +309,3 @@ def grab_banner(host: str, port: int, timeout: float = 0.5) -> str | None:
         return None
     return _clean_banner(data) or None
 
-
-def grab_banners(
-    host: str,
-    ports: list[int],
-    timeout: float = 0.5,
-    workers: int = 100,
-) -> dict[int, str]:
-    """Đọc banner song song cho danh sách cổng đã mở.
-
-    Returns:
-        Từ điển ánh xạ số cổng sang banner đọc được. Cổng không có banner sẽ
-        không xuất hiện trong từ điển.
-    """
-    banners: dict[int, str] = {}
-    if not ports:
-        return banners
-
-    max_workers = max(1, min(workers, len(ports)))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(grab_banner, host, port, timeout): port
-            for port in ports
-        }
-        for future in as_completed(futures):
-            port = futures[future]
-            try:
-                banner = future.result()
-            except OSError:
-                banner = None
-            if banner:
-                banners[port] = banner
-    return banners

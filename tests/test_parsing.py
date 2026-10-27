@@ -67,7 +67,7 @@ class ParsePortsTest(unittest.TestCase):
 
 
 class ParseTargetTest(unittest.TestCase):
-    """Phân tích mục tiêu: IPv4 hoặc CIDR IPv4 tối đa /24."""
+    """Phân tích mục tiêu: IPv4 hoặc CIDR IPv4 từ /18 đến /32."""
 
     def test_single_ipv4(self) -> None:
         target = parse_target("192.168.1.10")
@@ -86,12 +86,24 @@ class ParseTargetTest(unittest.TestCase):
     def test_cidr_slash_30(self) -> None:
         self.assertEqual(str(parse_target("127.0.0.0/30")), "127.0.0.0/30")
 
-    def test_cidr_larger_than_slash_24_is_rejected(self) -> None:
-        for value in ("10.0.0.0/16", "192.168.0.0/23", "0.0.0.0/0", "127.0.0.0/8"):
+    def test_cidr_slash_18_at_the_boundary(self) -> None:
+        target = parse_target("10.0.0.0/18")
+        self.assertIsInstance(target, ipaddress.IPv4Network)
+        self.assertEqual(target.prefixlen, 18)
+
+    def test_cidr_slash_32_is_allowed(self) -> None:
+        self.assertEqual(str(parse_target("10.1.2.3/32")), "10.1.2.3/32")
+
+    def test_cidr_larger_than_slash_18_is_rejected(self) -> None:
+        for value in ("10.0.0.0/17", "10.0.0.0/16", "0.0.0.0/0", "127.0.0.0/8"):
             with self.subTest(value=value):
                 with self.assertRaises(argparse.ArgumentTypeError) as ctx:
                     parse_target(value)
-                self.assertIn("/24", str(ctx.exception))
+                self.assertIn("/18", str(ctx.exception))
+
+    def test_cidr_slash_23_is_allowed_now(self) -> None:
+        # /23 nằm trong khoảng cho phép mới (/18 đến /32).
+        self.assertEqual(str(parse_target("192.168.0.0/23")), "192.168.0.0/23")
 
     def test_invalid_targets_raise(self) -> None:
         for value in ("999.999.999.999", "khong-phai-ip", "192.168.1", "", "1.2.3.4/"):
